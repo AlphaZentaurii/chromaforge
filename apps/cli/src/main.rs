@@ -17,6 +17,7 @@
 //! <cli> calibrate-lightroom preset|fit|add|list|verify …
 //! <cli> calibrate-chart --shot RAW --corners "x,y x,y x,y x,y" [--light L] [--shot …]… [--chart 2014|2005] [--dcp OUT] [--preview DIR]
 //! <cli> compare REFERENCE TEST [--size N] [--no-align] [--diff OUT.png] [--json]
+//! <cli> flat-field REFERENCE.raw [--grid N] [--smooth S] [--check B.raw [--force]] [--save MAP.json] [--json]
 //! <cli> camdb extract [--contributor NAME] NATIVE.dng…
 //! <cli> camdb show MAKE MODEL
 //! ```
@@ -28,6 +29,7 @@ mod calibrate_chart;
 mod calibrate_lightroom;
 mod catalog_migrate;
 mod compare;
+mod flat_field;
 mod run_action;
 mod sync_folder;
 
@@ -165,6 +167,12 @@ USAGE:
       …, read through their embedded colour profiles). Lines them up, then prints CIEDE2000 (mean, median, p95,
       p99) overall, by tone band and by hue, with the lightness, saturation and hue bias. --size: long edge
       compared (default 512); --no-align: compare pixel for pixel; --diff: write a false-colour ΔE00 map.
+  {cli} flat-field REFERENCE.raw [--grid N] [--smooth S] [--check B.raw [--force]] [--save MAP.json] [--json]
+      Measure a flat-field reference (a raw shot through a diffuser): its light fall-off in EV at the corners and
+      along the radius, its optical centre, and the lens database's vignetting for the same lens, focal length and
+      aperture. --check applies the map to a second reference of the same camera, lens, focal length and aperture
+      (--force: of another) and reports the fall-off left; --save writes the map as JSON. --grid: cells along the
+      long side (default 48); --smooth: smoothing in cells (default 1).
   {cli} calibrate-lightroom probe -o DIR (--like RAW | --make MAKE --model MODEL) [--unique-model NAME] [--base-only]
       Write synthetic probe DNGs for a camera: colour patches spread through camera RGB, and one copy per
       slider-sweep step with that Lightroom setting embedded (applied when Lightroom imports it). Export them all
@@ -309,6 +317,7 @@ fn main() -> ExitCode {
         Some("calibrate-lightroom") => calibrate_lightroom::run(&args[1..]),
         Some("calibrate-chart") => calibrate_chart::run(&args[1..]),
         Some("compare") => compare::run(&args[1..]),
+        Some("flat-field") => flat_field::run(&args[1..]),
         Some("--version" | "-V" | "version") => {
             println!("{CLI} {}", env!("CARGO_PKG_VERSION"));
             Ok(())

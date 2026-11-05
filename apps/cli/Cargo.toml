@@ -20,6 +20,10 @@ lcc-denoise = { workspace = true }
 lcc-camdb = { workspace = true }
 lcc-colourfit = { workspace = true }
 lcc-raw = { workspace = true }
+lcc-meta = { workspace = true }
+lcc-hash = { workspace = true }
+lcc-geom = { workspace = true }
+lcc-pipeline = { workspace = true }
 chrono = { workspace = true }
 lcc-sysmem = { workspace = true }
 lcc-mcp = { workspace = true }

@@ -1,0 +1,349 @@
+use super::*;
+use crate::{Cfa, Normalized};
+
+const W: usize = 1200;
+const H: usize = 800;
+
+/// Deterministic noise.
+struct Lcg(u64);
+
+impl Lcg {
+    fn next(&mut self) -> f64 {
+        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (self.0 >> 11) as f64 / (1u64 << 53) as f64
+    }
+    /// About N(0, 1) (Irwin–Hall of 4).
+    fn gauss(&mut self) -> f64 {
+        (self.next() + self.next() + self.next() + self.next() - 2.0) * 3f64.sqrt()
+    }
+}
+
+/// A fall-off in EV (positive = darker): `k · d⁴`, `d` = distance from `(cx·W, cy·H)` over the half diagonal.
+fn radial(k: f64, cx: f64, cy: f64) -> impl Fn(f64, f64) -> f64 {
+    let hd = (W as f64).hypot(H as f64) / 2.0;
+    move |x, y| {
+        let d = ((x - cx * W as f64).powi(2) + (y - cy * H as f64).powi(2)).sqrt() / hd;
+        k * d.powi(4)
+    }
+}
+
+struct Scene<'a> {
+    falloff: &'a dyn Fn(f64, f64) -> f64,
+    seed: u64,
+    /// Dust discs: centre x, y and radius (px); each halves the light inside.
+    dust: Vec<(f64, f64, f64)>,
+    /// Fraction of photosites that are hot (read 0.9; a quarter of them 1.0).
+    hot: f64,
+}
+
+/// An RGGB mosaic of a flat field at mid grey through `falloff`, with 1 % noise.
+fn mosaic(s: &Scene) -> Normalized {
+    let mut rng = Lcg(s.seed);
+    let mut data = vec![0f32; W * H];
+    for y in 0..H {
+        for x in 0..W {
+            let (px, py) = (x as f64 + 0.5, y as f64 + 0.5);
+            let mut v = 0.5 * (-(s.falloff)(px, py)).exp2() * (1.0 + 0.01 * rng.gauss());
+            if s.dust.iter().any(|&(dx, dy, r)| (px - dx).hypot(py - dy) <= r) {
+                v *= 0.5;
+            }
+            if rng.next() < s.hot {
+                v = if rng.next() < 0.25 { 1.0 } else { 0.9 };
+            }
+            data[y * W + x] = v as f32;
+        }
+    }
+    Normalized { width: W, height: H, cpp: 1, data, cfa: Cfa::bayer("RGGB") }
+}
+
+fn clean(falloff: &dyn Fn(f64, f64) -> f64, seed: u64) -> Normalized {
+    mosaic(&Scene { falloff, seed, dust: Vec::new(), hot: 0.0 })
+}
+
+fn dust(seed: u64, big: bool) -> Vec<(f64, f64, f64)> {
+    let mut rng = Lcg(seed);
+    let mut d: Vec<(f64, f64, f64)> = (0..12).map(|_| (rng.next() * W as f64, rng.next() * H as f64, 2.0 + rng.next() * 2.0)).collect();
+    if big {
+        d.push((310.0, 220.0, 8.0));
+        d.push((900.0, 600.0, 8.0));
+    }
+    d
+}
+
+fn map_of(n: &Normalized) -> FlatFieldMap {
+    build(n, FlatFieldSource::default(), &FlatFieldOptions::default()).unwrap()
+}
+
+/// The map's error against the true fall-off, both taken relative to the frame centre: (largest |error| over the
+/// interior, the four corners' errors, signed: positive = the map corrects more than the truth).
+fn errors(map: &FlatFieldMap, truth: &dyn Fn(f64, f64) -> f64) -> (f64, [f64; 4]) {
+    let (cx, cy) = (W as f64 / 2.0, H as f64 / 2.0);
+    let rel = |x: f64, y: f64| (map.ev_at(x, y) - map.ev_at(cx, cy)) - (truth(x, y) - truth(cx, cy));
+    let mut interior = 0.0f64;
+    // interior: inside the outermost cell centres
+    let (mx, my) = (W as f64 / 96.0, H as f64 / 64.0);
+    for j in 0..=40 {
+        for i in 0..=40 {
+            let x = mx + (W as f64 - 2.0 * mx) * i as f64 / 40.0;
+            let y = my + (H as f64 - 2.0 * my) * j as f64 / 40.0;
+            interior = interior.max(rel(x, y).abs());
+        }
+    }
+    let (w, h) = (W as f64, H as f64);
+    (interior, [rel(0.0, 0.0), rel(w, 0.0), rel(0.0, h), rel(w, h)])
+}
+
+#[test]
+fn a_radial_falloff_is_recovered() {
+    let truth = radial(1.5, 0.5, 0.5);
+    let map = map_of(&clean(&truth, 1));
+    let (interior, corners) = errors(&map, &truth);
+    eprintln!("1.5 EV r⁴: interior max |error| {interior:.4} EV, corners {corners:.4?} EV");
+    assert!(interior <= 0.03, "interior error {interior}");
+    assert!(corners.iter().all(|e| e.abs() <= 0.05), "corner errors {corners:?}");
+}
+
+#[test]
+fn a_steep_falloff_is_not_understated_or_overshot_at_the_corners() {
+    let truth = radial(3.0, 0.5, 0.5);
+    let map = map_of(&clean(&truth, 2));
+    let (interior, corners) = errors(&map, &truth);
+    eprintln!("3 EV r⁴: interior max |error| {interior:.4} EV, corners {corners:.4?} EV");
+    assert!(corners.iter().all(|e| (-0.05..=0.1).contains(e)), "corner errors {corners:?}");
+}
+
+#[test]
+fn dust_and_hot_pixels_do_not_change_the_map() {
+    let truth = radial(1.5, 0.5, 0.5);
+    let a = map_of(&clean(&truth, 3));
+    let b = map_of(&mosaic(&Scene { falloff: &truth, seed: 3, dust: dust(7, true), hot: 0.002 }));
+    let worst = a.ev_grid().ev.iter().zip(&b.ev_grid().ev).map(|(x, y)| (x - y).abs()).fold(0.0f64, f64::max);
+    eprintln!("dust + hot pixels: largest cell difference {worst:.4} EV");
+    assert!(worst <= 0.02, "{worst}");
+}
+
+/// Greens of the cell (col, row) of the default 48 × 32 grid over W × H.
+fn greens_of_cell(n: &Normalized, col: usize, row: usize) -> Vec<usize> {
+    let (x0, x1) = cell_span(col, 48, W);
+    let (y0, y1) = cell_span(row, 32, H);
+    let cfa = n.cfa.clone().unwrap();
+    (y0..y1).flat_map(|y| (x0..x1).map(move |x| (x, y))).filter(|&(x, y)| cfa.color_at(x, y) == 1).map(|(x, y)| y * W + x).collect()
+}
+
+#[test]
+fn a_clipped_reference_is_refused_and_names_the_cell() {
+    let truth = radial(1.0, 0.5, 0.5);
+    let mut n = clean(&truth, 4);
+    let greens = greens_of_cell(&n, 5, 3);
+    let few = greens.len() / 200; // 0.5 %
+    for &i in greens.iter().take(few) {
+        n.data[i] = 1.0;
+    }
+    assert!(build(&n, FlatFieldSource::default(), &FlatFieldOptions::default()).is_ok(), "0.5 % clipped passes");
+    let many = (greens.len() * 2).div_ceil(100); // 2 %
+    for &i in greens.iter().take(many) {
+        n.data[i] = 1.0;
+    }
+    match build(&n, FlatFieldSource::default(), &FlatFieldOptions::default()) {
+        Err(FlatFieldError::Clipped { col, row, percent }) => {
+            assert_eq!((col, row), (5, 3));
+            assert!((percent - 100.0 * many as f64 / greens.len() as f64).abs() < 1e-9, "{percent}");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn amounts_scale_the_correction_in_ev() {
+    let map = map_of(&clean(&radial(1.5, 0.5, 0.5), 5));
+    let (x, y) = (37.0, 51.0);
+    let full = map.gain_at(x, y, 1.0) as f64;
+    let ev = map.ev_at(x, y);
+    assert!(ev > 0.5, "a corner region is corrected ({ev})");
+    assert!((full.log2() - ev).abs() < 1e-5, "1.0 is the stored gain");
+    for (amount, factor) in [(0.0, 0.0), (0.5, 0.5), (1.2, 1.2), (2.0, 1.2), (f64::NAN, 0.0), (-1.0, 0.0)] {
+        let g = map.gain_at(x, y, amount) as f64;
+        assert!((g.log2() - factor * ev).abs() < 1e-5, "amount {amount}: {g}");
+    }
+    // everywhere at 0
+    for (x, y) in [(0.0, 0.0), (600.0, 400.0), (1200.0, 800.0)] {
+        assert_eq!(map.gain_at(x, y, 0.0), 1.0);
+    }
+    assert_eq!(effective_gain(2.0, 0.5), 2f64.sqrt());
+    assert_eq!(effective_gain(4.0, f64::NAN), 1.0);
+    assert_eq!(DEFAULT_FLAT_FIELD_AMOUNT, 1.0);
+}
+
+fn check_of(map: &FlatFieldMap, n: &Normalized) -> CheckReport {
+    let opts = FlatFieldOptions::default();
+    let cells = cell_means(n, map.grid, &opts).unwrap();
+    check(map, &cells, &opts).unwrap()
+}
+
+#[test]
+fn a_map_corrects_another_reference_of_the_same_setup() {
+    let truth = radial(1.5, 0.5, 0.5);
+    let map = map_of(&clean(&truth, 6));
+    let b = mosaic(&Scene { falloff: &truth, seed: 60, dust: dust(61, false), hot: 0.001 });
+    let r = check_of(&map, &b);
+    eprintln!("check: max |residual| {:.4} EV, peak-to-peak {:.4} EV", r.max_abs, r.peak_to_peak);
+    assert!(r.passes(), "{} {}", r.max_abs, r.peak_to_peak);
+    // before correction the corner is clearly darker
+    assert!(r.before.at(0.0, 0.0) > 1.0);
+}
+
+#[test]
+fn an_off_centre_falloff_is_built_and_corrected() {
+    let truth = radial(1.5, 0.6, 0.5);
+    let map = map_of(&clean(&truth, 8));
+    let (interior, corners) = errors(&map, &truth);
+    eprintln!("shifted 10 %: interior {interior:.4} EV, corners {corners:.4?} EV");
+    let r = check_of(&map, &mosaic(&Scene { falloff: &truth, seed: 80, dust: dust(81, false), hot: 0.001 }));
+    eprintln!("shifted check: max |residual| {:.4} EV, peak-to-peak {:.4} EV", r.max_abs, r.peak_to_peak);
+    assert!(r.passes(), "{} {}", r.max_abs, r.peak_to_peak);
+}
+
+#[test]
+fn the_optical_centre_is_found_and_a_gradient_fits_badly() {
+    let truth = radial(1.5, 0.6, 0.5);
+    let shifted = fit_centre(&map_of(&clean(&truth, 9)).ev_grid()).unwrap();
+    eprintln!("centre fit: {shifted:?}");
+    assert!((shifted.dx_pct - 10.0).abs() < 1.0 && shifted.dy_pct.abs() < 1.0, "{shifted:?}");
+    // a sky: brightness falling linearly across the frame by 0.6 EV, no lens fall-off
+    let tilt = |x: f64, _y: f64| 0.6 * x / W as f64;
+    let sky = fit_centre(&map_of(&clean(&tilt, 10)).ev_grid()).unwrap();
+    eprintln!("tilt fit: {sky:?}");
+    assert!(sky.rms_ev > 0.01 && sky.rms_ev > 5.0 * shifted.rms_ev, "tilt {sky:?} vs lens {shifted:?}");
+}
+
+#[test]
+fn padding_continues_a_linear_ramp() {
+    let (cols, rows) = (7, 5);
+    let v: Vec<f64> = (0..rows).flat_map(|r| (0..cols).map(move |c| 0.3 + 0.2 * c as f64 - 0.15 * r as f64)).collect();
+    for (a, b) in median3(&v, cols, rows).iter().zip(&v) {
+        assert!((a - b).abs() < 1e-12);
+    }
+    for (a, b) in gaussian(&v, cols, rows, 1.5).iter().zip(&v) {
+        assert!((a - b).abs() < 1e-12);
+    }
+}
+
+#[test]
+fn sensor_and_source_coordinates_round_trip_for_every_orientation() {
+    let all = [
+        Orientation::Normal,
+        Orientation::FlipH,
+        Orientation::Rotate180,
+        Orientation::FlipV,
+        Orientation::Transpose,
+        Orientation::Rotate90,
+        Orientation::Transverse,
+        Orientation::Rotate270,
+    ];
+    for exif in all {
+        for user in all {
+            for aspect in [1.0f32, 2.0] {
+                let f = SensorFrame::new([640, 480], Rect::new(12, 8, 600, 400), aspect, exif);
+                let (ow, oh) = f.oriented_size(user);
+                // a fitted copy at half size
+                let (sw, sh) = (ow / 2.0, oh / 2.0);
+                for p in [Point::new(0.0, 0.0), Point::new(13.25, 101.5), Point::new(sw, sh), Point::new(sw * 0.3, sh * 0.9)] {
+                    let s = f.source_to_sensor(p, sw, sh, user);
+                    let q = f.sensor_to_source(s, sw, sh, user);
+                    assert!((q.x - p.x).abs() < 1e-9 && (q.y - p.y).abs() < 1e-9, "{exif:?} {user:?} {aspect}: {p:?} → {s:?} → {q:?}");
+                    // inside the default crop
+                    assert!(s.x >= 12.0 - 1e-9 && s.x <= 612.0 + 1e-9 && s.y >= 8.0 - 1e-9 && s.y <= 408.0 + 1e-9, "{s:?}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn source_positions_land_on_the_sensor_pixel_the_picture_shows_there() {
+    let all = [
+        Orientation::Normal,
+        Orientation::FlipH,
+        Orientation::Rotate180,
+        Orientation::FlipV,
+        Orientation::Transpose,
+        Orientation::Rotate90,
+        Orientation::Transverse,
+        Orientation::Rotate270,
+    ];
+    let (cw, ch) = (5usize, 3usize);
+    let crop = Rect::new(2, 1, cw, ch);
+    for exif in all {
+        for user in all {
+            let f = SensorFrame::new([9, 6], crop, 1.0, exif);
+            // the developed picture, each pixel labelled with its index, oriented as the app does it
+            let mut img = lcc_raster::Rgb32f::new(cw, ch);
+            for (i, px) in img.data.iter_mut().enumerate() {
+                *px = [i as f32, 0.0, 0.0];
+            }
+            let img = img.into_oriented(exif).into_oriented(user);
+            let (ow, oh) = f.oriented_size(user);
+            assert_eq!((img.width as f64, img.height as f64), (ow, oh));
+            for y in 0..img.height {
+                for x in 0..img.width {
+                    let s = f.source_to_sensor(Point::new(x as f64 + 0.5, y as f64 + 0.5), ow, oh, user);
+                    let (dx, dy) = ((s.x - crop.x as f64).floor() as usize, (s.y - crop.y as f64).floor() as usize);
+                    assert_eq!(img.get(x, y)[0] as usize, dy * cw + dx, "{exif:?} {user:?} at ({x}, {y})");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn bad_maps_and_references_are_errors_not_panics() {
+    let good = map_of(&clean(&radial(1.0, 0.5, 0.5), 11));
+    assert!(good.validate().is_ok());
+    let broken = [
+        FlatFieldMap { gains: vec![1.0; 3], ..good.clone() },
+        FlatFieldMap { gains: good.gains.iter().map(|_| f32::NAN).collect(), ..good.clone() },
+        FlatFieldMap { gains: good.gains.iter().map(|_| 0.0).collect(), ..good.clone() },
+        FlatFieldMap { grid: [100_000, 100_000], ..good.clone() },
+        FlatFieldMap { grid: [1, 32], ..good.clone() },
+        FlatFieldMap { sensor: [0, 0], ..good.clone() },
+        FlatFieldMap { version: 99, ..good.clone() },
+    ];
+    for m in &broken {
+        assert!(m.validate().is_err(), "{:?} {:?}", m.grid, m.sensor);
+        // sampling a broken map never panics
+        let _ = m.gain_at(1e300, -1e300, 1.0);
+        let _ = m.gain_at(f64::NAN, 3.0, f64::INFINITY);
+    }
+    let json = r#"{"version":1,"source":{},"sensor":[10,10],"grid":[300,2],"gains":[]}"#;
+    let m: FlatFieldMap = serde_json::from_str(json).unwrap();
+    assert!(m.validate().is_err());
+
+    let opts = FlatFieldOptions::default();
+    let src = FlatFieldSource::default;
+    let empty = Normalized { width: 0, height: 0, cpp: 1, data: vec![], cfa: Cfa::bayer("RGGB") };
+    assert!(build(&empty, src(), &opts).is_err());
+    let tiny = Normalized { width: 8, height: 8, cpp: 1, data: vec![0.5; 64], cfa: Cfa::bayer("RGGB") };
+    assert!(build(&tiny, src(), &opts).is_err());
+    let lying = Normalized { width: 400, height: 300, cpp: 1, data: vec![0.5; 10], cfa: Cfa::bayer("RGGB") };
+    assert!(build(&lying, src(), &opts).is_err());
+    let black = Normalized { width: 400, height: 300, cpp: 1, data: vec![0.0; 120_000], cfa: Cfa::bayer("RGGB") };
+    assert!(matches!(build(&black, src(), &opts), Err(FlatFieldError::TooDark { .. })));
+    let white = Normalized { width: 400, height: 300, cpp: 1, data: vec![1.0; 120_000], cfa: Cfa::bayer("RGGB") };
+    assert!(matches!(build(&white, src(), &opts), Err(FlatFieldError::Clipped { .. })));
+    let nan = Normalized { width: 400, height: 300, cpp: 1, data: vec![f32::NAN; 120_000], cfa: Cfa::bayer("RGGB") };
+    assert!(build(&nan, src(), &opts).is_err());
+    let two_cpp = Normalized { width: 400, height: 300, cpp: 2, data: vec![0.5; 240_000], cfa: None };
+    assert!(matches!(build(&two_cpp, src(), &opts), Err(FlatFieldError::NotCfa)));
+    for bad in [
+        FlatFieldOptions { long_cells: 1, ..opts },
+        FlatFieldOptions { smoothing: f64::NAN, ..opts },
+        FlatFieldOptions { trim: 0.5, ..opts },
+        FlatFieldOptions { clip: 0.0, ..opts },
+    ] {
+        assert!(matches!(build(&tiny, src(), &bad), Err(FlatFieldError::BadOptions(_))));
+    }
+    // a second reference of another size
+    let other = Normalized { width: 400, height: 300, cpp: 1, data: vec![0.5; 120_000], cfa: Cfa::bayer("RGGB") };
+    let cells = cell_means(&other, good.grid, &opts).unwrap();
+    assert!(check(&good, &cells, &opts).is_err());
+}
