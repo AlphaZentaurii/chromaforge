@@ -10,8 +10,8 @@
 use std::path::Path;
 
 use lcc_geom::{Orientation, Point};
-use lcc_raw::flat_field::{self, CentreFit, CheckReport, FlatFieldMap, FlatFieldOptions, FlatFieldSource, OffsetFit, SensorFrame};
 use lcc_raw::SensorWindow;
+use lcc_raw::flat_field::{self, CentreFit, CheckReport, FlatFieldMap, FlatFieldOptions, FlatFieldSource, OffsetFit, SensorFrame};
 use serde_json::{Value, json};
 
 /// Radii of the radial table, in % of the half diagonal.
@@ -132,6 +132,9 @@ struct Shot {
     frame: SensorFrame,
     /// Where the active area sits on the full sensor, when the file says.
     window: Option<SensorWindow>,
+    /// The picture's place on the sensor for the lens profile (`lcc_engine::lens_profiles::ImageArea`), as the app
+    /// finds it: `None` for the full sensor or without a window.
+    area: Option<lcc_engine::lens_profiles::ImageArea>,
     meta: lcc_meta::Metadata,
     source: FlatFieldSource,
 }
@@ -159,8 +162,9 @@ impl Shot {
         let window = lcc_raw::sensor_window(&bytes, [normalized.width, normalized.height]);
         drop(bytes);
         let frame = SensorFrame::of(&raw);
+        let area = lcc_engine::lens_profiles::ImageArea::of(&raw.info(), window);
         let source = FlatFieldSource::from_metadata(&meta, Some(sha1));
-        Ok(Shot { path: path.to_string(), normalized, frame, window, meta, source })
+        Ok(Shot { path: path.to_string(), normalized, frame, window, area, meta, source })
     }
 }
 
@@ -246,8 +250,9 @@ fn ratios(measured: &Profile, profile: &Profile) -> Vec<Option<f64>> {
 /// The lens database's vignetting for the shot, sampled where the measured fall-off is, or why there is none.
 ///
 /// Evaluated as `Warp::gain` evaluates it (`crates/pipeline/src/optics.rs`): the app looks the profile up for the
-/// developed size and the file's orientation (`lens_profiles::resolve_raw` → `lookup_with`); here the same lookup
-/// with `Orientation::Normal`, the same profile before `reorient_lens` re-expresses it for the rotated frame. The
+/// developed size, the file's orientation and the picture's place on the sensor (`lens_profiles::resolve_raw` →
+/// `lookup_framed`, which gives a cropped image area the part of the profile under it); here the same lookup with
+/// `Orientation::Normal`, the same profile before `reorient_lens` re-expresses it for the rotated frame. The
 /// profile's own radius (lensfun's `pa` model: 1 at half the calibration frame's diagonal) is converted by
 /// `Profile::correction` (`crates/lensdb/src/lib.rs`) to a DNG `FixVignetteRadial` with 1 at this frame's half
 /// diagonal, centred on it; its gain is `embedded_vignette_gain` at `Warp::gain`'s full strength, and the fall-off
@@ -264,7 +269,7 @@ fn lens_profile(shot: &Shot) -> Result<(String, Profile), String> {
         shot.source.focal_length.map_or("? mm".into(), |f| format!("{f} mm")),
         shot.source.aperture.map_or("?".into(), |a| a.to_string())
     );
-    let (correction, applied) = lcc_engine::lens_profiles::lookup_with(&db, &shot.meta, None, w, h, Orientation::Normal)
+    let (correction, applied) = lcc_engine::lens_profiles::lookup_framed(&db, &shot.meta, None, w, h, Orientation::Normal, shot.area.as_ref())
         .ok_or(format!("no profile in the lens database for {at}"))?;
     let v = correction.vignette.ok_or(format!("the lens database's profile has no vignetting for {at}"))?;
     let name = match applied {
