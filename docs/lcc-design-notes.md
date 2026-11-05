@@ -379,8 +379,210 @@ known sky shot (`OO_6002029_Mrz 26 2021_10132`) is marked as such.
   (`docs/lens-profiles.md`).
 - Where a profile has vignetting, the measured corner fall-off is 1.10–1.28× the profile's on full-frame shots.
 
-**Found on the way (not fixed here):** the app's lens-profile lookup scales the profile by the developed frame's
-half diagonal and the camera's crop factor. A 5:4 frame of a full-frame body therefore gets the profile's
-full-frame corner fall-off at its own, nearer corners: the same 1.912 EV for the 50 mm at 3:2 and at 5:4. That
-over-corrects 5:4 photos by about 0.2 EV at the corners. The fix is the same sensor window: scale by the full
-sensor's diagonal and centre the profile on the sensor.
+**Found on the way, fixed separately (PR #856, `fix/lens-profile-crop-modes`):** the lens-profile lookup scaled the
+profile by the developed frame's half diagonal and the camera's crop factor. A 5:4 frame of a full-frame body
+therefore got the profile's full-frame corner fall-off at its own, nearer corners: the same 1.912 EV for the 50 mm
+at 3:2 and at 5:4. That over-corrected 5:4 by 0.46 EV at the corners (1.447 EV is right) and 16:9 by 0.20 EV.
+`lookup_framed` now evaluates the profile for the camera's normal frame and re-expresses it for the image area
+exactly. The `flat-field` diagnostic uses it too: after the fix the 85 mm's measured/profile ratio is 1.28 in both
+3:2 and 5:4 (it was 1.02 in 5:4).
+
+Image-area evidence from three Z 8 diffuser shots (50 mm f/1.8; 1:1, DX, 16:9): every cross-check between them
+passes (max |residual| 0.005–0.011 EV, peak-to-peak 0.008–0.022 EV), and the offset search finds the CropHiSpeed
+offsets within 1–10 px. Ignoring the offset makes the spread 0.18–0.36 EV. A 3:2 Z 8 shot from 2024 fails against
+all three (peak-to-peak 0.23–0.54 EV), with its centre 1–2 % off theirs: it was lit differently.
+
+## 10. Phase 2 plan: applying a map in the pipeline, and the UI (2026-11-05, no code yet)
+
+Phase 2 makes a measured map part of an edit. It starts from `flat-field-lcc` rebased onto PR #856, so
+`lcc_raw::SensorWindow`, `lookup_framed` and `ImageArea` are available.
+
+### Where the map multiplies in
+
+- **CPU:** `Warp::gain` (`crates/pipeline/src/optics.rs`, the `gain` method). It gains a third factor next to
+  manual vignetting (`vig_stops`) and profile / embedded vignetting (`lens_vig`).
+  - `Warp` carries an `Option<Arc<FieldGain>>`: the map already re-expressed in `Warp`'s own frame (the
+    user-oriented, EXIF-oriented, default-cropped source, at full size) as a small EV grid, plus the amount.
+  - Doing the coordinate work once, when the frame is built, keeps `gain()` cheap: bilinear in log space, then
+    `2^(amount · ev)`. It also lets the CPU and the GPU sample the very same numbers.
+  - The grid is resampled from the sensor map at, say, 64 × 64 nodes. It's exact under orientation changes (nodes
+    map to nodes) and loses nothing visible for a smooth field.
+- **`has_gain()`** (optics.rs, next to `is_identity`) must include the flat field. Otherwise a photo with no other
+  warp takes the Copy / Affine sampling path and the map is silently skipped (`geometry.rs`, the
+  `(!warp.is_identity()).then_some(warp)` in `Frame::with_lens`). `genpatch.rs` already multiplies by `wp.gain(g)`,
+  so generative-fill patches follow.
+- **GPU:**
+  - `warp_params` (`crates/gpu/src/render.rs`) packs the warp into 65 values, guarded by a
+    `debug_assert_eq!(p.len(), 65)`. It grows by the grid's size, origin and spacing and the amount (in a new
+    parameter range documented in `geom.wgsl`'s layout comment).
+  - The `sample_warp` kernel gets a fourth buffer next to `base`, `out` and `coverage`: the EV grid as `f32`.
+  - `warp_gain` in `crates/gpu/src/wgsl/geom.wgsl` multiplies by `exp2(amount · bilinear(grid, s))`. `pu(64u)`
+    ("gain?") becomes true when a map is active.
+- **Parity test:** a case in `crates/gpu/tests/it/equivalence.rs` (which already has ~35 vignetting cases): a
+  synthetic map on a rotated, 5:4-windowed source, CPU against GPU within the file's existing tolerance. Also one
+  with the map plus manual vignetting.
+
+### Coordinates
+
+- The map is in sensor coordinates (active area, unrotated). For each photo the engine builds the field from the
+  photo's `SensorFrame` (active area, default crop, pixel aspect, EXIF orientation) and the user orientation.
+  - For each grid node, `SensorFrame::source_to_sensor` gives the sensor position.
+  - That is shifted by `FlatFieldMap::placement(active size, window)` when the map and the photo are different
+    image areas of one sensor.
+  - Then `FlatFieldMap::ev_at` samples it.
+- The decode path (`crates/engine/src/files.rs`, `load_bytes_now`) already has the raw and the bytes. It puts the
+  `SensorFrame` and `lcc_raw::sensor_window` into `SourceInfo` (a new `Option<SensorPlacement>` field), the way it
+  puts the lens there. `Frame::with_lens` then builds the field when the settings ask for one.
+- Fitted and binned previews: `source_to_sensor` scales by the source's actual size, so previews and exports sample
+  the same sensor positions.
+
+### Interaction with other vignetting
+
+- With a flat field active, **profile and embedded vignetting are off**: `lens_vig` = 0 whatever
+  `optics.profile_vignetting` says. The map is the measured truth for this lens and aperture, and multiplying both
+  would correct twice.
+- Profile **distortion and lateral CA stay**: the map is luminance only.
+- **Manual lens vignetting** (`optics.vignetting`, `vig_stops`) stays as a fine-tune on top. Post-crop vignette
+  (Effects) is unaffected.
+- The Optics section says so: "Profile vignetting is replaced by the flat field" under the profile sliders, which
+  are disabled for vignetting only.
+- Open: whether `camera_preview::correct_vignetting` (the camera-JPEG colour fit) should use the flat field instead
+  of the lens profile. It models what the camera's JPEG did, which is the camera's own vignette control, so leaving
+  it on the profile is probably right.
+
+### Storage
+
+- **In the develop settings.**
+  - Fields: `optics.flat_field: Option<EmbeddedFlatField>` (the map) and `optics.flat_field_amount: f64` (0–120,
+    default 100). Both are serde-skipped while there is no map, so every existing photo keeps its JSON and
+    `hash64`.
+  - The map is stored compactly: grid size, sensor, window, source (body model and serial, lens, focal length,
+    aperture, SHA-1), and the gains as log2 in 1/4096-EV `u16`, base64. A 48 × 32 grid is 3 KB of JSON.
+  - Copy, paste, sync and presets carry it through the Optics group (a new `OPTICS_ITEMS` entry), and XMP sidecars
+    through `lc:settings` (the full settings JSON).
+  - **Cost:** the catalog stores each distinct settings value once (`develop_settings` table, content-addressed).
+    But every History step and Version of an edited photo is a distinct value, each with its own 3 KB copy. On a
+    photo with 50 steps that's ~150 KB. Acceptable, and the open question below asks whether to reference maps by
+    hash instead.
+- **A per-body library of maps to pick from**, like the hot-pixel maps (`crates/engine/src/sensor_maps.rs`: one JSON
+  file per body in `<config>/sensor-maps`, keyed by `body_key`, damaged files set aside as `.bad`).
+  - New `<config>/flat-fields/<body>/<lens>_<focal>_<aperture>_<sha8>.json`, each a `FlatFieldMap`, validated on
+    read.
+  - "Create from this photo" adds the map there and to the photo. "Choose from library" lists the body's maps,
+    best match first.
+  - The library is a convenience; a photo's own copy in its settings is what renders.
+- **Web build:** `config::config_dir()` gives no settings folder there, so there is no per-body library on disk.
+  - The settings copy works unchanged (it lives in the catalog and in exported sidecars).
+  - "Choose from library" there lists the maps of photos already in the library (the distinct `optics.flat_field`
+    values).
+  - "Create from this photo" works if the source raw is available (the web build decodes raws).
+
+### Matching a map to a photo
+
+| Check | Result |
+|---|---|
+| Active area not the map's, and no window that places it (`FlatFieldMap::placement` → `Mismatch`) | **refused**: not applied, with a notice in Optics |
+| Another sensor (window's sensor size differs, e.g. Z 7 8288 vs Z 8 8280), or camera model differs | **refused** |
+| Same model, another body serial | **warning** ("made on another body": pixel response and dust differ slightly) |
+| Lens differs | **warning** (strong) |
+| Focal length differs (zoom) | **warning**, with the difference |
+| Aperture differs | **warning**, with the difference in stops. Fall-off changes a lot with aperture, so the library sorts the nearest aperture first |
+| Focus distance | not checked: NEFs don't give a usable one yet; LensData `0x0098` is enciphered (see the Phase 2 notes below) |
+
+A refused map is kept on the photo (so a later fix or another photo can use it) but has no effect. "Choose from
+library" shows only maps that can be placed.
+
+### Z 8 in-body stabilisation centre (NEFInfo `0x0008`)
+
+- `crates/raw/src/vendor/nef_lens.rs` already reads the optical centre's offset from the image-area centre (entry
+  `0x0008`, "where the in-body stabilization left the sensor"). It's validated for the Z 6II, Z 8 and Z f, and is up
+  to ~100 px with Z lenses (−90.1, +18.6 in one file).
+- Vignetting is centred on the lens axis, so between a reference and a photo shot with different sensor positions
+  the map should move by the difference of their offsets.
+- **How big:** a 50 mm f/1.8 corner fall-off of 1.9 EV has a slope of about 4.8 EV per half diagonal at the corner,
+  ~0.001 EV per px on a 45 MP sensor. 100 px of shift is about ±0.1 EV at opposite corners, 40 px about ±0.04 EV.
+  That matches the ~40 px seen between the two Z 7 85 mm shots, which left 0.011 EV of spread against 0.002 at the
+  best placement.
+- **Proposal:**
+  - Shift by `photo offset − reference offset` where both files record it (Z 6II / Z 8 / Z f), as an extra
+    placement offset; otherwise no shift.
+  - Validate with two Z 8 references shot handheld (IBIS on) against one on a tripod (IBIS off): the `--check`
+    residual with the shift should drop to the tripod pair's.
+  - The Z 7 isn't validated for `0x0008` yet (it isn't in `VALIDATED`); check its files first.
+
+### UI
+
+- **Desktop, Lens Corrections section** (`crates/ui-egui/src/panels/edit.rs`, the `section(app, ui, &d, "optics",
+  …)` block): a "Flat Field (LCC)" sub-section under the profile controls.
+  - With no map: **Create from This Photo**, and **Choose from Library…** (a list: body, lens, focal length,
+    aperture, date, match warnings).
+  - With a map: its source line (lens, focal length, aperture, body, any warning), the **Amount** slider (control
+    `optics.flatFieldAmount`, 0–120, default 100, step 1), and **Remove**.
+  - Create on a clipped or too-dark photo shows the builder's error (`Clipped` names the cell and the percentage).
+- **Modern dock:** the Optics group (`crates/ui-egui/src/modern_dock.rs`, `Group::Optics` in `control_ids`) gains the
+  `optics.flatFieldAmount` pill while the photo has a map. The rest is in the Lens Corrections section the group
+  already opens.
+- **Commands** (everything is a command; UI, CLI, control channel and MCP share them):
+  - `flatField.create {id?}` (from the photo's raw; adds to the library and applies);
+  - `flatField.list {body?}`;
+  - `flatField.apply {map, ids}`;
+  - `flatField.remove {ids}`;
+  - the amount through `develop.set` / `develop.merge`.
+- **Copy and sync:** `OPTICS_ITEMS` (`crates/develop/src/presets.rs`) gains `item("optics.flatField", "Flat Field
+  (LCC)", &["optics.flat_field", "optics.flat_field_amount"])`. Syncing across a shoot then carries the map to
+  every photo of that lens and aperture, as Capture One users expect.
+- **Locale strings:** the new labels and messages go in `crates/ui-egui/locales/fork/<code>.json` for every complete
+  language, which `tests_i18n_coverage.rs` enforces.
+  - Labels: "Flat Field (LCC)", "Create from This Photo", "Choose from Library…", "Remove", "Amount".
+  - Notices: "Profile vignetting is replaced by the flat field", "Made with another lens", "Made at another aperture
+    ({diff} stops)", "Made on another camera body", "This flat field doesn't fit this photo's image area".
+  - The pl, cs, it, ka, sv, fi, id and vi catalogs are listed as partial and only report what they lack.
+
+### Process version, catalog version
+
+- **No process version:** the fields are new and off by default, so no existing photo renders differently
+  (`docs/process-versions.md`).
+- **Catalog `VERSION`** (`crates/catalog/src/journal.rs`, now 16): bump to the next number. An older build would
+  silently drop `optics.flat_field` when it saves the photo, which loses the user's map, which is the case the rule
+  ("a serialized field … an older build would misread or silently drop") is for. Earlier develop fields (`sensor`,
+  `hdr`, `skin`) shipped without a bump, but dropping them cost a setting, not measured data.
+- **`RENDER_CACHE_VERSION`:** no bump; photos with a map have a new `hash64`.
+
+### Phase 2 steps, each separately testable
+
+1. **Schema:** `EmbeddedFlatField` (compact encoding, serde round trip, hostile input), the two Optics fields, the
+   control spec, the `OPTICS_ITEMS` entry, the catalog `VERSION` bump. Tests: settings without a map keep their JSON
+   and hash; copy/paste carries it; damaged maps load as "no map".
+2. **Placement:** `SensorPlacement` in `SourceInfo` from the decode path; the field grid built from `SensorFrame`,
+   the window and `placement`. Tests: all 8 × 8 orientations and the 5:4 / 1:1 / 16:9 / DX windows give each sensor
+   position its map value; a refused map gives no field.
+3. **CPU render:** `Warp::gain` and `has_gain`, profile vignetting off while a map is active. Tests: a synthetic
+   fall-off source corrected flat to < 0.01 EV; amount 0 / 100 / 120; manual vignetting still applies; no map →
+   byte-identical renders.
+4. **GPU render:** the extra buffer and parameters, `warp_gain`; the equivalence test.
+5. **Library and commands:** `<config>/flat-fields`, `flatField.create/list/apply/remove`, MCP schema, the activity
+   stack for Create (a full decode). Tests: hostile files set aside; a matching table for the warnings; the web
+   build without a folder.
+6. **UI:** the Optics sub-section, the Modern pill, locale strings, What's New. Verify by running the app and taking
+   screenshots; a SIL step that creates, applies and removes a map.
+7. **IBIS shift** (Z 6II / Z 8 / Z f): the placement offset from NEFInfo `0x0008`, after the tripod / handheld
+   validation above.
+8. **Later:** importing Capture One's LCC from the catalog (the paused develop import), and writing the map into
+   DNG export as an `OpcodeList2` GainMap.
+
+### Open questions
+
+1. **Inline maps or references?** Should a map be embedded in each settings value (as planned; ~3 KB per History
+   step and Version), or stored once in the library catalog and referenced by its SHA-1? Referencing needs its own
+   catalog table, sidecar handling and an import path; inline is simpler and travels by itself.
+2. **Grid size for the field in `Warp`'s frame** (64 × 64 proposed), and whether the GPU buffer should be `f16` to
+   save memory (it's tiny either way).
+3. **Several references per lens:** with references at f/1.8, f/2.8 and f/4, should a photo at f/2.2 get an
+   interpolated map (log-space blend by stops), or only the nearest one? Interpolation is cheap but adds a "made from
+   two references" case to the UI.
+4. **Sky references:** the batch flags them (centre offset, RMS, failing checks). Should Create refuse an uneven
+   reference, or only warn?
+5. **Z 7 and the IBIS offset:** does the Z 7 record NEFInfo `0x0008` like the Z 8, and can it be validated?
+6. **Amount above 100 %:** Capture One allows 120. Is that useful for a measured map, or only for compatibility with
+   imported Capture One amounts?
+7. **The camera-JPEG colour fit** (`camera_preview::correct_vignetting`): keep it on the lens profile, as proposed?
