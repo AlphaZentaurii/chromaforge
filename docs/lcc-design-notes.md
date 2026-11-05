@@ -446,9 +446,15 @@ Phase 2 makes a measured map part of an edit. It starts from `flat-field-lcc` re
   (Effects) is unaffected.
 - The Optics section says so: "Profile vignetting is replaced by the flat field" under the profile sliders, which
   are disabled for vignetting only.
-- Open: whether `camera_preview::correct_vignetting` (the camera-JPEG colour fit) should use the flat field instead
-  of the lens profile. It models what the camera's JPEG did, which is the camera's own vignette control, so leaving
-  it on the profile is probably right.
+- **The camera-look fit:** since upstream #3402 (5bc88f079, `LOOK_VERSION` 21), the per-file camera look
+  (`camera_preview::correct_vignetting`) is fitted on a sensor proxy that has been corrected with the lens-profile
+  vignetting the render applies.
+  - That fit runs at decode, before any develop setting is known.
+  - **Proposal for Phase 2:** keep it on the lens profile, so the fitted look doesn't depend on a develop setting
+    (switching the flat field on or off must not refit the look or change the decoded source).
+  - The cost: a photo whose profile vignetting is off because of a flat field gets a look fitted with a slightly
+    different correction than the one rendered.
+  - **Maintainer question:** is that acceptable, or should the fit take the flat field when the photo has one?
 
 ### Storage
 
@@ -462,8 +468,7 @@ Phase 2 makes a measured map part of an edit. It starts from `flat-field-lcc` re
     through `lc:settings` (the full settings JSON).
   - **Cost:** the catalog stores each distinct settings value once (`develop_settings` table, content-addressed).
     But every History step and Version of an edited photo is a distinct value, each with its own 3 KB copy. On a
-    photo with 50 steps that's ~150 KB. Acceptable, and the open question below asks whether to reference maps by
-    hash instead.
+    photo with 50 steps that's ~150 KB. Acceptable: maps are inline (decision 1 below), not referenced by hash.
 - **A per-body library of maps to pick from**, like the hot-pixel maps (`crates/engine/src/sensor_maps.rs`: one JSON
   file per body in `<config>/sensor-maps`, keyed by `body_key`, damaged files set aside as `.bad`).
   - New `<config>/flat-fields/<body>/<lens>_<focal>_<aperture>_<sha8>.json`, each a `FlatFieldMap`, validated on
@@ -487,10 +492,34 @@ Phase 2 makes a measured map part of an edit. It starts from `flat-field-lcc` re
 | Lens differs | **warning** (strong) |
 | Focal length differs (zoom) | **warning**, with the difference |
 | Aperture differs | **warning**, with the difference in stops. Fall-off changes a lot with aperture, so the library sorts the nearest aperture first |
-| Focus distance | not checked: NEFs don't give a usable one yet; LensData `0x0098` is enciphered (see the Phase 2 notes below) |
+| Focus distance | not checked: NEFs don't give a usable one yet (see *Focus distance* below) |
 
 A refused map is kept on the photo (so a later fix or another photo can use it) but has no effect. "Choose from
 library" shows only maps that can be placed.
+
+### Focus distance
+
+Fall-off depends on focus distance as well as aperture, so matching could use it. What the 20 Z 7 / Z 8 NEFs
+record:
+
+- **EXIF SubjectDistance (`0x9206`):** absent in every file.
+- **Nikon maker note `0x0098` LensData:** present in every file, 108 bytes, version `0800` / `0801` (Z 7) and `0802`
+  (Z 8).
+  - Per ExifTool's Nikon tag-name documentation, LensData from version 0201 on is enciphered with the body serial
+    (`0x001d`) and the shutter count (`0x00a7`), both of which these files record.
+  - Earlier versions carry a one-byte, log-scale focus distance. Whether 0800–0802 do, and at what resolution, can't
+    be checked without deciphering.
+- **Deciphering, clean-room:**
+  - dcraw's Nikon decipher (its `xlat` tables) lies outside the RESTRICTED block and may be translated under
+    AGENTS.md's dcraw reference policy. That policy keeps dcraw *data* out apart from `adobe_coeff`, and `xlat` is
+    decoding data, so using it is **a maintainer call**.
+  - ExifTool's code and tables stay off-limits (Artistic/GPL); only its tag-name documentation may be read.
+- **Reliability**, even once decoded: Nikon reports the lens's focus position, quantised. It is typically coarse at
+  long distances, "infinity" past a few tens of metres, and meaningless or absent with manual and adapted lenses
+  (four of the 20 files name no lens at all).
+- **Proposed experiment** before relying on it: shoot one lens at known distances (0.5 m, 1 m, 3 m, infinity), several
+  frames each. Decipher LensData and check the value is monotone in distance and repeatable at each one.
+- Until then matching ignores focus distance, as the lens-profile lookup does (`Shot::distance` is `None`).
 
 ### Z 8 in-body stabilisation centre (NEFInfo `0x0008`)
 
@@ -570,19 +599,36 @@ library" shows only maps that can be placed.
 8. **Later:** importing Capture One's LCC from the catalog (the paused develop import), and writing the map into
    DNG export as an `OpcodeList2` GainMap.
 
-### Open questions
+### Decisions (2026-11-06)
 
-1. **Inline maps or references?** Should a map be embedded in each settings value (as planned; ~3 KB per History
-   step and Version), or stored once in the library catalog and referenced by its SHA-1? Referencing needs its own
-   catalog table, sidecar handling and an import path; inline is simpler and travels by itself.
-2. **Grid size for the field in `Warp`'s frame** (64 × 64 proposed), and whether the GPU buffer should be `f16` to
-   save memory (it's tiny either way).
-3. **Several references per lens:** with references at f/1.8, f/2.8 and f/4, should a photo at f/2.2 get an
-   interpolated map (log-space blend by stops), or only the nearest one? Interpolation is cheap but adds a "made from
-   two references" case to the UI.
-4. **Sky references:** the batch flags them (centre offset, RMS, failing checks). Should Create refuse an uneven
-   reference, or only warn?
-5. **Z 7 and the IBIS offset:** does the Z 7 record NEFInfo `0x0008` like the Z 8, and can it be validated?
-6. **Amount above 100 %:** Capture One allows 120. Is that useful for a measured map, or only for compatibility with
-   imported Capture One amounts?
-7. **The camera-JPEG colour fit** (`camera_preview::correct_vignetting`): keep it on the lens profile, as proposed?
+1. **Maps are inline** in the develop settings, about 3 KB each, not referenced by hash. Inline travels by itself
+   through XMP, copy, sync and presets, and needs no catalog table or import path.
+2. **The field in `Warp`'s frame is a 64 × 64 `f32` grid**, on the CPU and in the GPU buffer alike (16 KB; no
+   `f16`).
+3. **Nearest aperture only in Phase 2.** With references at several apertures, a photo gets the one nearest in
+   stops, with the aperture warning. Interpolating between two references (a log-space blend by stops) comes later.
+4. **Uneven references warn, they don't refuse.** A reference the centre fit flags (`CentreFit::uneven`), or one
+   whose centre is far off, is accepted with a notice in Optics. Clipped and too-dark references are still refused
+   by the builder.
+5. **The Z 7's stabilisation offset** (NEFInfo `0x0008`) is checked in step 7, together with the shift.
+6. **Amount range 0–120 %**, default 100 %.
+7. **The camera-look fit stays on the lens profile**, pending the maintainer (see *Interaction with other
+   vignetting*).
+
+### PR split
+
+- **PR A: steps 1–4.** Schema, placement, CPU and GPU render, so a map in the settings renders, and renders the same
+  on both paths. Reviewable on its own with synthetic maps; nothing visible in the UI yet.
+- **PR B: steps 5–6.** Library, commands and UI: creating, choosing and removing maps, the Amount slider, locale
+  strings and What's New. This is what users see.
+- **PR C: step 7.** The stabilisation shift, after the tripod / handheld validation. It changes renders of photos
+  that already have a map, so it lands on its own with its measurements.
+- Step 8 stays later.
+
+### Questions for the maintainer
+
+1. **Catalog `VERSION`:** bump it for `optics.flat_field`, since an older build would drop the user's map when it
+   saves? (`sensor`, `hdr` and `skin` shipped without a bump.)
+2. **Camera-look fit:** keep the per-file look fitted with the lens-profile vignetting even when a flat field
+   replaces it in the render, so decoding doesn't depend on a develop setting? Or fit with the flat field?
+3. **PR split:** A (render path) → B (library, commands, UI) → C (stabilisation shift), as above?
