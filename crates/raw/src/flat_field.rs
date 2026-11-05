@@ -27,7 +27,7 @@ use lcc_geom::{Orientation, Point};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::{Normalized, RawImage, Rect, stretched_height};
+use crate::{Normalized, RawImage, Rect, SensorWindow, stretched_height};
 
 /// Version of the [`FlatFieldMap`] record.
 pub const FORMAT_VERSION: u32 = 1;
@@ -107,6 +107,10 @@ pub struct FlatFieldMap {
     pub grid: [usize; 2],
     /// `grid[0] · grid[1]` gains, row-major.
     pub gains: Vec<f32>,
+    /// Where the reference's active area sits on the camera's full sensor, when the file says
+    /// ([`crate::sensor_window`]). It lets the map serve a smaller image area of the same sensor ([`Self::placement`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<SensorWindow>,
 }
 
 /// How a reference is measured.
@@ -167,6 +171,10 @@ pub enum FlatFieldError {
     BadOptions(String),
     #[error("invalid flat-field map: {0}")]
     Invalid(String),
+    /// A valid map and a frame it can't be applied to or compared with (another sensor, an unknown image area, too
+    /// little overlap).
+    #[error("{0}")]
+    Mismatch(String),
 }
 
 /// The grid for a `width × height` active area: `long_cells` along the long side, the short side in proportion.
@@ -405,7 +413,7 @@ pub fn build(n: &Normalized, source: FlatFieldSource, opts: &FlatFieldOptions) -
     let ev = smooth_ev(&cells, opts)?;
     let top = ev.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     let gains = ev.iter().map(|e| ((top - e).exp2() as f32).clamp(1.0, MAX_GAIN)).collect();
-    let map = FlatFieldMap { version: FORMAT_VERSION, source, sensor: [n.width, n.height], grid, gains };
+    let map = FlatFieldMap { version: FORMAT_VERSION, source, sensor: [n.width, n.height], grid, gains, window: None };
     map.validate()?;
     Ok(map)
 }
@@ -476,7 +484,12 @@ pub fn sample_grid(sensor: [usize; 2], grid: [usize; 2], cell: &dyn Fn(usize, us
     if out_y {
         step += (bilinear(ix, 1.0) - bilinear(ix, 0.0)).abs();
     }
-    value.clamp(near - step, near + step)
+    // (not `f64::clamp`, which panics on a NaN bound: a grid may mark cells it has no value for with NaN)
+    let (lo, hi) = (near - step, near + step);
+    if lo.is_nan() || hi.is_nan() || lo > hi {
+        return value;
+    }
+    value.max(lo).min(hi)
 }
 
 impl FlatFieldMap {
@@ -501,7 +514,43 @@ impl FlatFieldMap {
         if let Some(g) = self.gains.iter().find(|g| !(g.is_finite() && (1.0..=MAX_GAIN).contains(*g))) {
             return bad(format!("a gain of {g} (1 to {MAX_GAIN})"));
         }
+        if let Some(win) = &self.window
+            && !(win.is_valid() && win.size == self.sensor)
+        {
+            return bad("its sensor window doesn't match its active area".into());
+        }
         Ok(())
+    }
+
+    /// Where a photo whose active area is `size` (at `window` on its sensor, when known) sits on this map: the offset
+    /// from the photo's sensor coordinates to the map's. The same active area takes the map as it is; a smaller
+    /// image area of the same sensor (both windows known, the photo's inside the map's) takes the part under it.
+    /// Anything else is refused: another sensor, an unknown position, or a photo the map doesn't cover.
+    pub fn placement(&self, size: [usize; 2], window: Option<&SensorWindow>) -> Result<[f64; 2], FlatFieldError> {
+        let offset = self.relative_offset(size, window)?;
+        match (&self.window, window) {
+            (Some(m), Some(t)) if !m.contains(t) => Err(FlatFieldError::Mismatch("the map doesn't cover the photo's image area".into())),
+            _ => Ok(offset),
+        }
+    }
+
+    /// The offset from a frame's sensor coordinates to the map's, whether or not the map covers all of the frame: the
+    /// same active area (`[0, 0]`), or two known windows on one sensor (the difference of their origins). For
+    /// comparing over the area two image areas share ([`check`]); applying a map needs [`Self::placement`].
+    pub fn relative_offset(&self, size: [usize; 2], window: Option<&SensorWindow>) -> Result<[f64; 2], FlatFieldError> {
+        match (&self.window, window) {
+            (Some(m), Some(t)) if m.sensor != t.sensor => Err(FlatFieldError::Mismatch(format!(
+                "another sensor: {} × {} px, the map's {} × {} px",
+                t.sensor[0], t.sensor[1], m.sensor[0], m.sensor[1]
+            ))),
+            (Some(_), Some(t)) if t.size != size => Err(FlatFieldError::Mismatch("the photo's window doesn't match its active area".into())),
+            (Some(m), Some(t)) => Ok([t.origin[0] as f64 - m.origin[0] as f64, t.origin[1] as f64 - m.origin[1] as f64]),
+            _ if size == self.sensor => Ok([0.0, 0.0]),
+            _ => Err(FlatFieldError::Mismatch(format!(
+                "the active area is {} × {} px, the map's {} × {} px, and where it sits on the sensor is unknown",
+                size[0], size[1], self.sensor[0], self.sensor[1]
+            ))),
+        }
     }
 
     /// The map's fall-off in EV per cell (log2 of the gains; positive = darker than the brightest cell).
@@ -613,6 +662,16 @@ pub struct CentreFit {
     pub rms_ev: f64,
 }
 
+impl CentreFit {
+    /// Whether the fall-off is too uneven for a lens's own: the fit's RMS above 2 % of the mean corner fall-off
+    /// (`corner_ev`) or above 0.03 EV, whichever is larger. A strong fall-off is allowed a proportionally larger
+    /// misfit of the radial model.
+    pub fn uneven(&self, corner_ev: f64) -> bool {
+        let limit = (0.02 * corner_ev.abs()).max(0.03);
+        self.rms_ev.is_nan() || self.rms_ev > limit
+    }
+}
+
 /// Fit `EV(x, y) = a + b·d² + c·d⁴` to a grid of EV values (`d` = distance from a centre `(cx, cy)` in half-diagonal
 /// units) and return the centre that fits best. The centre is searched coarse to fine within ±25 % of the frame; a,
 /// b, c are linear least squares at each candidate. A flat-topped fall-off has no single brightest cell, which is why
@@ -636,8 +695,8 @@ pub fn fit_centre(g: &EvGrid) -> Option<CentreFit> {
     let rms_at = |fx: f64, fy: f64| -> Option<f64> {
         let (cx, cy) = (wf * (0.5 + fx), hf * (0.5 + fy));
         let d2 = |x: f64, y: f64| ((x - cx).powi(2) + (y - cy).powi(2)) / hd2;
-        // normal equations of the basis (1, d², d⁴): moments s_k = Σ d^(2k), t_k = Σ e·d^(2k)
-        let (mut s, mut t) = ([0.0f64; 5], [0.0f64; 3]);
+        // normal equations of the basis (1, d², d⁴, d⁶): moments s_k = Σ d^(2k), t_k = Σ e·d^(2k)
+        let (mut s, mut t) = ([0.0f64; 7], [0.0f64; 4]);
         for &(x, y, e) in &pts {
             let q = d2(x, y);
             let mut p = 1.0;
@@ -649,16 +708,18 @@ pub fn fit_centre(g: &EvGrid) -> Option<CentreFit> {
                 p *= q;
             }
         }
-        let [s0, s1, s2, s3, s4] = s;
-        let [a, b, c] = solve3([[s0, s1, s2], [s1, s2, s3], [s2, s3, s4]], t)?;
+        let [s0, s1, s2, s3, s4, s5, s6] = s;
+        let m = [[s0, s1, s2, s3], [s1, s2, s3, s4], [s2, s3, s4, s5], [s3, s4, s5, s6]];
+        let [a, b, c, e6] = solve4(m, t)?;
         let sum: f64 = pts
             .iter()
             .map(|&(x, y, e)| {
                 let q = d2(x, y);
-                (a + b * q + c * q * q - e).powi(2)
+                (a + q * (b + q * (c + q * e6)) - e).powi(2)
             })
             .sum();
-        Some((sum / pts.len() as f64).sqrt())
+        let rms = (sum / pts.len() as f64).sqrt();
+        rms.is_finite().then_some(rms)
     };
     let (mut best, mut best_rms) = ((0.0, 0.0), rms_at(0.0, 0.0)?);
     for (half, step) in [(0.25f64, 0.05f64), (0.05, 0.01), (0.01, 0.002), (0.002, 0.0004)] {
@@ -678,20 +739,42 @@ pub fn fit_centre(g: &EvGrid) -> Option<CentreFit> {
     Some(CentreFit { dx_pct: best.0 * 100.0, dy_pct: best.1 * 100.0, rms_ev: best_rms })
 }
 
-/// Solve a 3 × 3 system by Cramer's rule; `None` when (nearly) singular.
-fn solve3(m: [[f64; 3]; 3], b: [f64; 3]) -> Option<[f64; 3]> {
-    let det = |[[a, b, c], [d, e, f], [g, h, i]]: [[f64; 3]; 3]| a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
-    let d = det(m);
-    let scale = m.iter().flatten().fold(0.0f64, |a, v| a.max(v.abs()));
-    if !d.is_finite() || d.abs() <= 1e-12 * scale.powi(3) {
+/// Solve a 4 × 4 system by Gaussian elimination with partial pivoting; `None` when it is (nearly) singular: a pivot
+/// below `1e-12` of the matrix's largest entry, or a result that isn't finite.
+fn solve4(m: [[f64; 4]; 4], b: [f64; 4]) -> Option<[f64; 4]> {
+    // augmented rows [m | b]
+    let mut a: [[f64; 5]; 4] = [[0.0; 5]; 4];
+    for ((row, mr), br) in a.iter_mut().zip(m.iter()).zip(b.iter()) {
+        row[..4].copy_from_slice(mr);
+        row[4] = *br;
+    }
+    let scale = m.iter().flatten().fold(0.0f64, |s, v| s.max(v.abs()));
+    if !(scale.is_finite() && scale > 0.0) {
         return None;
     }
-    let [[m00, m01, m02], [m10, m11, m12], [m20, m21, m22]] = m;
-    let [b0, b1, b2] = b;
-    let x0 = det([[b0, m01, m02], [b1, m11, m12], [b2, m21, m22]]) / d;
-    let x1 = det([[m00, b0, m02], [m10, b1, m12], [m20, b2, m22]]) / d;
-    let x2 = det([[m00, m01, b0], [m10, m11, b1], [m20, m21, b2]]) / d;
-    [x0, x1, x2].iter().all(|v| v.is_finite()).then_some([x0, x1, x2])
+    for col in 0..4 {
+        // the row with the largest entry in this column, from the diagonal down
+        let pivot = (col..4).max_by(|&i, &j| a[i][col].abs().total_cmp(&a[j][col].abs()))?;
+        let p = a[pivot][col].abs();
+        if p.is_nan() || p <= 1e-12 * scale {
+            return None;
+        }
+        a.swap(col, pivot);
+        let head = a[col];
+        for row in a.iter_mut().skip(col + 1) {
+            let f = row[col] / head[col];
+            for (r, h) in row.iter_mut().zip(head.iter()).skip(col) {
+                *r -= f * h;
+            }
+        }
+    }
+    let mut x = [0.0f64; 4];
+    for col in (0..4).rev() {
+        let row = a[col];
+        let known: f64 = row.iter().zip(x.iter()).skip(col + 1).take(3 - col).map(|(r, v)| r * v).sum();
+        x[col] = (row[4] - known) / row[col];
+    }
+    x.iter().all(|v| v.is_finite()).then_some(x)
 }
 
 /// What a map leaves of a second reference's fall-off ([`check`]).
@@ -705,6 +788,8 @@ pub struct CheckReport {
     pub max_abs: f64,
     /// Brightest minus darkest corrected cell, EV.
     pub peak_to_peak: f64,
+    /// Cells of the second reference the map covers (the residuals are over these; the others are NaN in `after`).
+    pub cells_used: usize,
 }
 
 impl CheckReport {
@@ -714,45 +799,152 @@ impl CheckReport {
     }
 }
 
-/// Apply `map` at full strength to `cells`, the cells of a second reference of the same setup on the same grid
-/// ([`cell_means`] with `map.grid`), and report what is left. Levels are relative to the median corrected cell, not to
-/// the centre or the brightest cell, so an off-centre fall-off or a lopsided light shows as a residual instead of
-/// moving the reference level.
-pub fn check(map: &FlatFieldMap, cells: &CellGrid, opts: &FlatFieldOptions) -> Result<CheckReport, FlatFieldError> {
-    map.validate()?;
-    if cells.sensor != map.sensor {
-        return Err(FlatFieldError::Invalid(format!(
-            "the active area differs ({} × {} px, the map is for {} × {} px)",
-            cells.sensor[0], cells.sensor[1], map.sensor[0], map.sensor[1]
-        )));
+/// Fewest cells a check must cover.
+const MIN_CHECK_CELLS: usize = 4;
+
+/// The cells of `cells` (in their order) that lie wholly on `map` when moved by `offset` (sensor px of the cells'
+/// frame → the map's), widened on every side by `margin` px.
+fn covered(map: &FlatFieldMap, cells: &CellGrid, offset: [f64; 2], margin: f64) -> Vec<usize> {
+    let [cols, rows] = cells.grid;
+    let [w, h] = cells.sensor;
+    let (mw, mh) = (map.sensor[0] as f64, map.sensor[1] as f64);
+    (0..rows)
+        .flat_map(|r| (0..cols).map(move |c| (c, r)))
+        .filter(|&(c, r)| {
+            let (x0, x1) = cell_span(c, cols, w);
+            let (y0, y1) = cell_span(r, rows, h);
+            let (ax, bx) = (x0 as f64 + offset[0] - margin, x1 as f64 + offset[0] + margin);
+            let (ay, by) = (y0 as f64 + offset[1] - margin, y1 as f64 + offset[1] + margin);
+            ax >= 0.0 && ay >= 0.0 && bx <= mw && by <= mh
+        })
+        .map(|(c, r)| r * cols + c)
+        .collect()
+}
+
+/// Each listed cell's level after the map's full correction, log2.
+fn corrected(map: &FlatFieldMap, cells: &CellGrid, offset: [f64; 2], which: &[usize]) -> Result<Vec<f64>, FlatFieldError> {
+    let cols = cells.grid[0].max(1);
+    which
+        .iter()
+        .map(|&i| {
+            let m = cells.means.get(i).copied().unwrap_or(f64::NAN);
+            if !(m.is_finite() && m > 1e-6) {
+                return Err(FlatFieldError::TooDark { col: i % cols, row: i / cols, level: m });
+            }
+            let p = cell_centre(cells.sensor, cells.grid, i % cols, i / cols);
+            Ok(m.log2() + f64::from(map.gain_at(p.x + offset[0], p.y + offset[1], 1.0)).log2())
+        })
+        .collect()
+}
+
+fn median(v: &[f64]) -> f64 {
+    let mut s = v.to_vec();
+    s.sort_unstable_by(f64::total_cmp);
+    let mid = s.len() / 2;
+    if s.len().is_multiple_of(2) {
+        (s.get(mid.saturating_sub(1)).copied().unwrap_or(0.0) + s.get(mid).copied().unwrap_or(0.0)) / 2.0
+    } else {
+        s.get(mid).copied().unwrap_or(0.0)
     }
-    if cells.grid != map.grid || cells.means.len() != map.gains.len() {
-        return Err(FlatFieldError::Invalid("the cells aren't on the map's grid".into()));
+}
+
+/// Apply `map` at full strength to `cells`, a second reference of the same setup measured on its own grid
+/// ([`cell_means`]), placed on the map at `offset` ([`FlatFieldMap::placement`]), and report what is left over the
+/// cells the map covers. Levels are relative to the median corrected cell, not to the centre or the brightest cell, so
+/// an off-centre fall-off or a lopsided light shows as a residual instead of moving the reference level.
+pub fn check(map: &FlatFieldMap, cells: &CellGrid, offset: [f64; 2], opts: &FlatFieldOptions) -> Result<CheckReport, FlatFieldError> {
+    map.validate()?;
+    let [cols, rows] = cells.grid;
+    if cols.checked_mul(rows) != Some(cells.means.len()) {
+        return Err(FlatFieldError::Invalid("the cells don't match their grid".into()));
     }
     let smoothed = smooth_ev(cells, opts)?;
     let top = smoothed.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     let before = EvGrid { sensor: cells.sensor, grid: cells.grid, ev: smoothed.iter().map(|e| top - e).collect() };
-    let [cols, _] = cells.grid;
-    let mut corrected = Vec::with_capacity(cells.means.len());
-    for (i, &m) in cells.means.iter().enumerate() {
-        if !(m.is_finite() && m > 1e-6) {
-            return Err(FlatFieldError::TooDark { col: i % cols, row: i / cols, level: m });
-        }
-        let p = cell_centre(cells.sensor, cells.grid, i % cols, i / cols);
-        corrected.push(m.log2() + f64::from(map.gain_at(p.x, p.y, 1.0)).log2());
+    let used = covered(map, cells, offset, 0.0);
+    if used.len() < MIN_CHECK_CELLS {
+        return Err(FlatFieldError::Mismatch("the map covers too little of the second reference".into()));
     }
-    let mut sorted = corrected.clone();
-    sorted.sort_unstable_by(f64::total_cmp);
-    let mid = sorted.len() / 2;
-    let median = if sorted.len() % 2 == 0 {
-        (sorted.get(mid.saturating_sub(1)).copied().unwrap_or(0.0) + sorted.get(mid).copied().unwrap_or(0.0)) / 2.0
-    } else {
-        sorted.get(mid).copied().unwrap_or(0.0)
+    let levels = corrected(map, cells, offset, &used)?;
+    let mid = median(&levels);
+    let mut residual = vec![f64::NAN; cells.means.len()];
+    for (&i, l) in used.iter().zip(&levels) {
+        if let Some(r) = residual.get_mut(i) {
+            *r = mid - l;
+        }
+    }
+    let max_abs = levels.iter().fold(0.0f64, |a, l| a.max((mid - l).abs()));
+    let (lo, hi) = levels.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), l| (lo.min(*l), hi.max(*l)));
+    Ok(CheckReport {
+        before,
+        after: EvGrid { sensor: cells.sensor, grid: cells.grid, ev: residual },
+        max_abs,
+        peak_to_peak: hi - lo,
+        cells_used: used.len(),
+    })
+}
+
+/// The offset search of [`find_offset`]: where a second reference fits the map best, against where it is said to be.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OffsetFit {
+    /// The offset the file's sensor window gives (sensor px of the second reference → the map's).
+    pub expected: [f64; 2],
+    /// The offset with the smallest residual spread, within ±64 px of `expected`.
+    pub found: [f64; 2],
+    /// Residual spread (standard deviation of the corrected cells, EV) at the found and the expected offset, and the
+    /// largest of the four at 16 px from the found one (how sharply the search could tell).
+    pub rms_found: f64,
+    pub rms_expected: f64,
+    pub rms_16px: f64,
+    /// The spread with no offset at all, when that placement covers the same cells (what ignoring the window costs).
+    pub rms_zero: Option<f64>,
+    /// Cells compared at every offset.
+    pub cells: usize,
+}
+
+/// Search the offset that fits `cells` (a second reference) to `map` best: ±64 px around `expected` in steps of 4,
+/// then ±4 px in steps of 1. The fit is the standard deviation of the corrected cells over a fixed set (those covered
+/// at every offset searched), so it doesn't depend on a reference level. A smooth fall-off moves little over a few
+/// pixels, so the minimum is shallow: [`OffsetFit::rms_16px`] says how sharply it was found.
+pub fn find_offset(map: &FlatFieldMap, cells: &CellGrid, expected: [f64; 2]) -> Result<OffsetFit, FlatFieldError> {
+    map.validate()?;
+    let set = covered(map, cells, expected, 72.0);
+    if set.len() < MIN_CHECK_CELLS {
+        return Err(FlatFieldError::Mismatch("the map covers too little of the second reference to search".into()));
+    }
+    let spread = |o: [f64; 2]| -> Result<f64, FlatFieldError> {
+        let v = corrected(map, cells, o, &set)?;
+        let mean = v.iter().sum::<f64>() / v.len() as f64;
+        Ok((v.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / v.len() as f64).sqrt())
     };
-    let residual: Vec<f64> = corrected.iter().map(|c| median - c).collect();
-    let max_abs = residual.iter().fold(0.0f64, |a, r| a.max(r.abs()));
-    let peak_to_peak = sorted.last().copied().unwrap_or(0.0) - sorted.first().copied().unwrap_or(0.0);
-    Ok(CheckReport { before, after: EvGrid { sensor: cells.sensor, grid: cells.grid, ev: residual }, max_abs, peak_to_peak })
+    let mut best = (expected, spread(expected)?);
+    for (half, step) in [(64.0f64, 4.0f64), (4.0, 1.0)] {
+        let centre = best.0;
+        let n = (half / step).round() as i32;
+        for iy in -n..=n {
+            for ix in -n..=n {
+                let o = [centre[0] + ix as f64 * step, centre[1] + iy as f64 * step];
+                if (o[0] - expected[0]).abs() > 64.0 || (o[1] - expected[1]).abs() > 64.0 {
+                    continue;
+                }
+                let s = spread(o)?;
+                if s < best.1 {
+                    best = (o, s);
+                }
+            }
+        }
+    }
+    let (found, rms_found) = best;
+    let rms_16px = [[16.0, 0.0], [-16.0, 0.0], [0.0, 16.0], [0.0, -16.0]]
+        .iter()
+        .map(|d| spread([found[0] + d[0], found[1] + d[1]]))
+        .collect::<Result<Vec<f64>, _>>()?
+        .into_iter()
+        .fold(0.0f64, f64::max);
+    let zero_covers = covered(map, cells, [0.0, 0.0], 0.0);
+    let rms_zero = if set.iter().all(|i| zero_covers.contains(i)) { Some(spread([0.0, 0.0])?) } else { None };
+    Ok(OffsetFit { expected, found, rms_found, rms_expected: spread(expected)?, rms_16px, rms_zero, cells: set.len() })
 }
 
 #[cfg(test)]

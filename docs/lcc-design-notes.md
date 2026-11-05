@@ -331,3 +331,56 @@ Nothing is in the pipeline, the settings or the UI yet.
 - The other same-setup pairs differ in image area (5:4 vs 3:2), and the Z 7 / Z 8 pairs differ in width, so they
   can't be compared under the identical-area rule.
 - Better references are needed: two diffuser shots per setup at the same image area.
+
+### Phase 1 follow-up: image areas, centre fit, lens database (uncommitted)
+
+**Image areas of one sensor.** Nikon records where the stored frame sits on the sensor in maker-note tag `0x001b`
+(CropHiSpeed: mode, sensor width and height, crop width and height, crop x and y):
+
+| Camera and image area | CropHiSpeed |
+|---|---|
+| Z 7, 3:2 | `11, 8288, 5520, 8288, 5520, 0, 0` |
+| Z 7, 5:4 | `3, 8288, 5520, 6912, 5520, 688, 0` (centred) |
+| Z 8, 3:2 | `11, 8280, 5520, 8280, 5520, 0, 0` |
+
+- `lcc_raw::sensor_window(bytes, active)` reads it (`crates/raw/src/sensor_window.rs`, `vendor/nef.rs`; it came in with the lens-profile crop-mode fix, PR #856). It returns a window only when the
+  window's size equals the active area of `normalized()`.
+- A map keeps its reference's window.
+- `FlatFieldMap::placement` lets a map serve a smaller image area of the same sensor: offset = origin difference.
+  Another sensor, an unknown position, or an area the map doesn't cover are refused.
+- `relative_offset` is the comparison-only version: a 5:4 map can be checked against a 3:2 shot over the area they
+  share.
+- `find_offset` searches ±64 px (steps of 4, then 1) for the placement with the smallest spread of corrected cells.
+
+Z 7 results:
+
+| Pair | Direction | Result | Offset from the file | Best fit |
+|---|---|---|---|---|
+| 85 mm f/1.8 | 3:2 map → 5:4 shot | PASS (max 0.024 EV, p2p 0.047) | +688, 0 | +648, −13 |
+| 85 mm f/1.8 | 5:4 map → 3:2 shot | PASS (max 0.027, p2p 0.047) | −688, 0 | −648, +13 |
+| 50 mm f/1.8 | 3:2 map → 5:4 shot | FAIL (max 0.097, p2p 0.128) | +688, 0 | +663, −2 |
+| 50 mm f/1.8 | 5:4 map → 3:2 shot | FAIL (max 0.091, p2p 0.119) | −688, 0 | −665, +1 |
+
+- The 85 mm best fit is about 40 px off the file's offset, consistently in both directions. That is the same as the
+  difference between the two shots' fitted optical centres (−0.5 % of 8288 vs 0.0 % of 6912 ≈ 41 px). The lens's
+  centre moved between the shots (in-body stabilisation recentres the sensor between frames), not the crop. The
+  crop offset itself holds: with no offset the spread is 0.17 EV instead of 0.011.
+- The 50 mm pair fails at any offset (the minimum is shallow, 0.021 vs 0.022 EV). Its two shots simply had different
+  fall-off: different light, or focus distance.
+
+**Centre fit:** `a + b·d² + c·d⁴ + e·d⁶`, solved with partial pivoting (`None` when nearly singular). "Uneven"
+means RMS > max(0.03 EV, 2 % of the mean corner fall-off). With this rule only the 28 mm pair still disagrees; the
+known sky shot (`OO_6002029_Mrz 26 2021_10132`) is marked as such.
+
+**Lens database:** a folder of lensfun XML files.
+- Set it in Settings ▸ Import ▸ Lens profiles: Download fetches lensfun's `data/db` into `<settings>/lensfun/db`, or
+  Choose Folder… points at an existing copy.
+- The choice is stored in `<settings>/lens-profiles.json` (`{"dir": …}`); `<PREFIX>_LENSFUN_DIR` overrides it
+  (`docs/lens-profiles.md`).
+- Where a profile has vignetting, the measured corner fall-off is 1.10–1.28× the profile's on full-frame shots.
+
+**Found on the way (not fixed here):** the app's lens-profile lookup scales the profile by the developed frame's
+half diagonal and the camera's crop factor. A 5:4 frame of a full-frame body therefore gets the profile's
+full-frame corner fall-off at its own, nearer corners: the same 1.912 EV for the 50 mm at 3:2 and at 5:4. That
+over-corrects 5:4 photos by about 0.2 EV at the corners. The fix is the same sensor window: scale by the full
+sensor's diagonal and centre the profile on the sensor.

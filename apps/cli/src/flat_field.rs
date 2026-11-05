@@ -10,7 +10,8 @@
 use std::path::Path;
 
 use lcc_geom::{Orientation, Point};
-use lcc_raw::flat_field::{self, CentreFit, CheckReport, FlatFieldMap, FlatFieldOptions, FlatFieldSource, SensorFrame};
+use lcc_raw::flat_field::{self, CentreFit, CheckReport, FlatFieldMap, FlatFieldOptions, FlatFieldSource, OffsetFit, SensorFrame};
+use lcc_raw::SensorWindow;
 use serde_json::{Value, json};
 
 /// Radii of the radial table, in % of the half diagonal.
@@ -48,7 +49,8 @@ pub fn run(args: &[String]) -> Result<(), String> {
         return Err("flat-field needs one reference raw: REFERENCE.raw".into());
     };
     let mut a = Shot::load(reference)?;
-    let map = flat_field::build(&a.normalized, a.source.clone(), &opts).map_err(|e| format!("{reference}: {e}"))?;
+    let mut map = flat_field::build(&a.normalized, a.source.clone(), &opts).map_err(|e| format!("{reference}: {e}"))?;
+    map.window = a.window;
     // (the samples aren't needed any more; a second reference is decoded next)
     a.normalized.data = Vec::new();
     if let Some(out) = &save {
@@ -68,9 +70,10 @@ pub fn run(args: &[String]) -> Result<(), String> {
             "source": map.source,
             "sensor": map.sensor,
             "grid": map.grid,
+            "window": map.window,
             "smoothing": opts.smoothing,
             "falloff": measured.json(),
-            "centre": centre,
+            "centre": centre_json(centre.as_ref(), &measured),
             "lensProfile": match &lens {
                 Ok((name, p)) => json!({"name": name, "falloff": p.json(), "ratio": ratios(&measured, p)}),
                 Err(why) => json!({"none": why}),
@@ -84,12 +87,17 @@ pub fn run(args: &[String]) -> Result<(), String> {
     println!("Reference: {reference}");
     println!("  {}", describe(&map.source));
     println!(
-        "  active area {} × {} px, grid {} × {} cells, smoothing σ {} cell(s)",
-        map.sensor[0], map.sensor[1], map.grid[0], map.grid[1], opts.smoothing
+        "  active area {} × {} px{}, grid {} × {} cells, smoothing σ {} cell(s)",
+        map.sensor[0],
+        map.sensor[1],
+        describe_window(map.window.as_ref()),
+        map.grid[0],
+        map.grid[1],
+        opts.smoothing
     );
     println!("Fall-off (EV, positive = darker than the brightest part):");
     print_corners(&measured);
-    print_centre(centre.as_ref());
+    print_centre(centre.as_ref(), &measured);
     match &lens {
         Ok((name, p)) => {
             println!("Radial, from the frame centre (r = % of the half diagonal; lens profile: {name}):");
@@ -122,6 +130,8 @@ struct Shot {
     path: String,
     normalized: lcc_raw::Normalized,
     frame: SensorFrame,
+    /// Where the active area sits on the full sensor, when the file says.
+    window: Option<SensorWindow>,
     meta: lcc_meta::Metadata,
     source: FlatFieldSource,
 }
@@ -145,11 +155,12 @@ impl Shot {
         meta.focal_length = meta.focal_length.or(r.focal_length);
         meta.focal_length_35mm = meta.focal_length_35mm.or(r.focal_length_35mm);
         meta.f_number = meta.f_number.or(r.f_number);
-        drop(bytes);
         let normalized = raw.normalized().map_err(|e| format!("{path}: {e}"))?;
+        let window = lcc_raw::sensor_window(&bytes, [normalized.width, normalized.height]);
+        drop(bytes);
         let frame = SensorFrame::of(&raw);
         let source = FlatFieldSource::from_metadata(&meta, Some(sha1));
-        Ok(Shot { path: path.to_string(), normalized, frame, meta, source })
+        Ok(Shot { path: path.to_string(), normalized, frame, window, meta, source })
     }
 }
 
@@ -195,7 +206,12 @@ impl Profile {
                         })
                         .collect(),
                 };
-                let n = values.len().max(1) as f64;
+                // (positions a map doesn't cover have no value: NaN)
+                let values: Vec<f64> = values.into_iter().filter(|v| v.is_finite()).collect();
+                if values.is_empty() {
+                    return Ring { pct, mean: f64::NAN, min: f64::NAN, max: f64::NAN };
+                }
+                let n = values.len() as f64;
                 Ring {
                     pct,
                     mean: values.iter().sum::<f64>() / n,
@@ -205,6 +221,12 @@ impl Profile {
             })
             .collect();
         Profile { corners, rings }
+    }
+
+    /// The mean of the four corners' fall-off (those with a value).
+    fn corner_mean(&self) -> f64 {
+        let v: Vec<f64> = self.corners.iter().copied().filter(|c| c.is_finite()).collect();
+        if v.is_empty() { f64::NAN } else { v.iter().sum::<f64>() / v.len() as f64 }
     }
 
     fn json(&self) -> Value {
@@ -257,29 +279,37 @@ fn lens_profile(shot: &Shot) -> Result<(String, Profile), String> {
 struct Checked {
     path: String,
     source: FlatFieldSource,
+    window: Option<SensorWindow>,
+    size: [usize; 2],
     forced: Vec<String>,
+    /// Whether the map covers all of the second reference (else the check is over the area they share).
+    covers_all: bool,
     before: Profile,
     after: Profile,
     centre: Option<CentreFit>,
     report: CheckReport,
+    /// The offset search, or why it couldn't run.
+    offset: Result<OffsetFit, String>,
 }
 
 fn check_against(map: &FlatFieldMap, a: &Shot, path: &str, opts: &FlatFieldOptions, force: bool) -> Result<Checked, String> {
     let b = Shot::load(path)?;
     let size = [b.normalized.width, b.normalized.height];
-    if size != map.sensor {
-        return Err(format!("{path}: the active area is {} × {} px, the reference's {} × {} px", size[0], size[1], map.sensor[0], map.sensor[1]));
-    }
     let differs = differences(&a.source, &b.source);
     if !differs.is_empty() && !force {
         return Err(format!("{path} is not the reference's setup ({}); --force compares anyway", differs.join(", ")));
     }
-    let cells = flat_field::cell_means(&b.normalized, map.grid, opts).map_err(|e| format!("{path}: {e}"))?;
-    let report = flat_field::check(map, &cells, opts).map_err(|e| format!("{path}: {e}"))?;
+    // the same active area, or a known image area of the same sensor (never another sensor, whatever --force says)
+    let offset = map.relative_offset(size, b.window.as_ref()).map_err(|e| format!("{path}: {e}"))?;
+    let covers_all = map.placement(size, b.window.as_ref()).is_ok();
+    let grid = flat_field::grid_for(size[0], size[1], opts.long_cells);
+    let cells = flat_field::cell_means(&b.normalized, grid, opts).map_err(|e| format!("{path}: {e}"))?;
+    let report = flat_field::check(map, &cells, offset, opts).map_err(|e| format!("{path}: {e}"))?;
+    let found = flat_field::find_offset(map, &cells, offset).map_err(|e| e.to_string());
     let before = Profile::of(&b.frame, &|p| report.before.at(p.x, p.y));
     let after = Profile::of(&b.frame, &|p| report.after.at(p.x, p.y));
     let centre = flat_field::fit_centre(&report.before);
-    Ok(Checked { path: b.path, source: b.source, forced: differs, before, after, centre, report })
+    Ok(Checked { path: b.path, source: b.source, window: b.window, size, forced: differs, covers_all, before, after, centre, report, offset: found })
 }
 
 /// What differs between two references' setups: camera, lens, focal length, aperture.
@@ -312,30 +342,58 @@ impl Checked {
         json!({
             "file": self.path,
             "source": self.source,
+            "size": self.size,
+            "window": self.window,
             "forced": self.forced,
+            "coversAll": self.covers_all,
+            "cellsUsed": self.report.cells_used,
             "before": self.before.json(),
             "after": self.after.json(),
-            "centre": self.centre,
+            "centre": centre_json(self.centre.as_ref(), &self.before),
             "maxAbsResidual": self.report.max_abs,
             "peakToPeak": self.report.peak_to_peak,
             "pass": self.report.passes(),
+            "offset": match &self.offset {
+                Ok(o) => json!(o),
+                Err(why) => json!({"none": why}),
+            },
         })
     }
 
     fn print(&self) {
         println!("Check: {}", self.path);
         println!("  {}", describe(&self.source));
+        println!("  active area {} × {} px{}", self.size[0], self.size[1], describe_window(self.window.as_ref()));
         if !self.forced.is_empty() {
             println!("  compared despite: {}", self.forced.join(", "));
         }
         println!("  Its own fall-off before correction (EV, from its brightest smoothed region):");
         print_corners(&self.before);
-        print_centre(self.centre.as_ref());
-        println!("  After the map at amount 1.0 (EV from the median corrected cell, positive = darker):");
+        print_centre(self.centre.as_ref(), &self.before);
+        let area = if self.covers_all { String::new() } else { format!(", over the {} cells the map covers", self.report.cells_used) };
+        println!("  After the map at amount 1.0 (EV from the median corrected cell, positive = darker{area}):");
         print_corners(&self.after);
         println!("     r   before   after (mean, min–max)");
         for (b, a) in self.before.rings.iter().zip(&self.after.rings) {
-            println!("  {:>3} %  {:>6.3}   {:>+7.3}  {:>+7.3}–{:<+7.3}", b.pct, b.mean, a.mean, a.min, a.max);
+            if a.mean.is_finite() {
+                println!("  {:>3} %  {:>6.3}   {:>+7.3}  {:>+7.3}–{:<+7.3}", b.pct, b.mean, a.mean, a.min, a.max);
+            } else {
+                println!("  {:>3} %  {:>6.3}   –  (not covered by the map)", b.pct, b.mean);
+            }
+        }
+        match &self.offset {
+            Ok(o) => {
+                println!(
+                    "  placement: expected offset {:+.0}, {:+.0} px (from the sensor windows); best fit {:+.0}, {:+.0} px",
+                    o.expected[0], o.expected[1], o.found[0], o.found[1]
+                );
+                let zero = o.rms_zero.map_or(String::new(), |z| format!(", with no offset {z:.4}"));
+                println!(
+                    "    residual spread: {:.4} EV at the fit, {:.4} at the expected offset, {:.4} at 16 px off{zero} ({} cells)",
+                    o.rms_found, o.rms_expected, o.rms_16px, o.cells
+                );
+            }
+            Err(why) => println!("  placement: no offset search ({why})"),
         }
         let verdict = if self.report.passes() { "PASS" } else { "FAIL" };
         println!(
@@ -345,14 +403,47 @@ impl Checked {
     }
 }
 
-fn print_corners(p: &Profile) {
-    let [tl, tr, bl, br] = p.corners;
-    println!("  corners: top-left {tl:.3}  top-right {tr:.3}  bottom-left {bl:.3}  bottom-right {br:.3}  (unrotated frame)");
+fn describe_window(w: Option<&SensorWindow>) -> String {
+    match w {
+        Some(w) if w.size != w.sensor => {
+            format!(" (at {}, {} on the {} × {} px sensor)", w.origin[0], w.origin[1], w.sensor[0], w.sensor[1])
+        }
+        Some(_) => " (the full sensor)".into(),
+        None => String::new(),
+    }
 }
 
-fn print_centre(c: Option<&CentreFit>) {
+/// Below this mean corner fall-off (EV) there is too little fall-off to place an optical centre.
+const MIN_CENTRE_EV: f64 = 0.1;
+
+fn centre_json(c: Option<&CentreFit>, p: &Profile) -> Value {
+    let corner = p.corner_mean();
     match c {
-        Some(c) => println!("  optical centre: {:+.1} % x, {:+.1} % y from the frame centre (fit RMS {:.4} EV)", c.dx_pct, c.dy_pct, c.rms_ev),
+        Some(c) => json!({
+            "dxPct": c.dx_pct,
+            "dyPct": c.dy_pct,
+            "rmsEv": c.rms_ev,
+            "uneven": c.uneven(corner),
+            "tooFlat": (corner.is_nan() || corner < MIN_CENTRE_EV),
+        }),
+        None => Value::Null,
+    }
+}
+
+fn print_corners(p: &Profile) {
+    let f = |v: f64| if v.is_finite() { format!("{v:+.3}") } else { "–".into() };
+    let [tl, tr, bl, br] = p.corners.map(f);
+    println!("  corners: top-left {tl}  top-right {tr}  bottom-left {bl}  bottom-right {br}  (unrotated frame)");
+}
+
+fn print_centre(c: Option<&CentreFit>, p: &Profile) {
+    let corner = p.corner_mean();
+    match c {
+        _ if (corner.is_nan() || corner < MIN_CENTRE_EV) => println!("  optical centre: too little fall-off to place one"),
+        Some(c) => {
+            let note = if c.uneven(corner) { " — uneven: more than a lens's radial fall-off (a sky gradient or uneven light?)" } else { "" };
+            println!("  optical centre: {:+.1} % x, {:+.1} % y from the frame centre (fit RMS {:.4} EV){note}", c.dx_pct, c.dy_pct, c.rms_ev);
+        }
         None => println!("  optical centre: no fit"),
     }
 }

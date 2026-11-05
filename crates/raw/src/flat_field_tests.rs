@@ -177,7 +177,7 @@ fn amounts_scale_the_correction_in_ev() {
 fn check_of(map: &FlatFieldMap, n: &Normalized) -> CheckReport {
     let opts = FlatFieldOptions::default();
     let cells = cell_means(n, map.grid, &opts).unwrap();
-    check(map, &cells, &opts).unwrap()
+    check(map, &cells, [0.0, 0.0], &opts).unwrap()
 }
 
 #[test]
@@ -342,8 +342,138 @@ fn bad_maps_and_references_are_errors_not_panics() {
     ] {
         assert!(matches!(build(&tiny, src(), &bad), Err(FlatFieldError::BadOptions(_))));
     }
-    // a second reference of another size
-    let other = Normalized { width: 400, height: 300, cpp: 1, data: vec![0.5; 120_000], cfa: Cfa::bayer("RGGB") };
-    let cells = cell_means(&other, good.grid, &opts).unwrap();
-    assert!(check(&good, &cells, &opts).is_err());
+    // a second reference of another size, with nothing saying where it sits on the sensor
+    assert!(good.relative_offset([400, 300], None).is_err());
+    assert!(good.placement([400, 300], None).is_err());
+    // a window that disagrees with the map's own active area
+    let wrong = FlatFieldMap { window: Some(SensorWindow { sensor: [2000, 800], origin: [0, 0], size: [999, 800] }), ..good.clone() };
+    assert!(wrong.validate().is_err());
+}
+
+/// A centred crop of `full`'s columns `x0..x0 + width` (the CFA phase kept: `x0` even).
+fn crop_columns(full: &Normalized, x0: usize, width: usize) -> Normalized {
+    let data = (0..full.height).flat_map(|y| full.data[y * full.width + x0..y * full.width + x0 + width].to_vec()).collect();
+    Normalized { width, height: full.height, cpp: 1, data, cfa: full.cfa.clone() }
+}
+
+/// Full-sensor window of the synthetic W × H sensor, and a 1000-wide centred image area of it (5:4 of 800 rows).
+fn windows() -> (SensorWindow, SensorWindow) {
+    (SensorWindow { sensor: [W, H], origin: [0, 0], size: [W, H] }, SensorWindow { sensor: [W, H], origin: [100, 0], size: [1000, H] })
+}
+
+#[test]
+fn a_full_sensor_map_serves_a_smaller_image_area_of_the_same_sensor() {
+    let truth = radial(1.5, 0.5, 0.5);
+    let (full, area) = windows();
+    let mut map = map_of(&clean(&truth, 20));
+    map.window = Some(full);
+    assert!(map.validate().is_ok());
+    let b = crop_columns(&mosaic(&Scene { falloff: &truth, seed: 21, dust: dust(22, false), hot: 0.001 }), 100, 1000);
+    let offset = map.placement([1000, H], Some(&area)).unwrap();
+    assert_eq!(offset, [100.0, 0.0]);
+    let opts = FlatFieldOptions::default();
+    let cells = cell_means(&b, grid_for(1000, H, opts.long_cells), &opts).unwrap();
+    let r = check(&map, &cells, offset, &opts).unwrap();
+    eprintln!("3:2 map → 5:4 shot: max |residual| {:.4} EV, peak-to-peak {:.4} EV, {} cells", r.max_abs, r.peak_to_peak, r.cells_used);
+    assert!(r.passes() && r.cells_used == cells.means.len());
+    let fit = find_offset(&map, &cells, offset).unwrap();
+    eprintln!("offset search: {fit:?}");
+    assert!((fit.found[0] - 100.0).abs() <= 8.0 && fit.found[1].abs() <= 8.0, "{fit:?}");
+    // ignoring the window (no offset) fits clearly worse than the window says
+    assert!(fit.rms_zero.is_some_and(|z| z > 2.0 * fit.rms_expected), "{fit:?}");
+}
+
+#[test]
+fn a_smaller_image_area_map_checks_over_the_area_it_shares() {
+    let truth = radial(1.5, 0.5, 0.5);
+    let (full, area) = windows();
+    let mut map = map_of(&crop_columns(&clean(&truth, 23), 100, 1000));
+    map.window = Some(area);
+    // it doesn't cover the full frame, so it doesn't apply there…
+    assert!(map.placement([W, H], Some(&full)).is_err());
+    // …but compares over the overlap
+    let offset = map.relative_offset([W, H], Some(&full)).unwrap();
+    assert_eq!(offset, [-100.0, 0.0]);
+    let opts = FlatFieldOptions::default();
+    let b = mosaic(&Scene { falloff: &truth, seed: 24, dust: dust(25, false), hot: 0.001 });
+    let cells = cell_means(&b, grid_for(W, H, opts.long_cells), &opts).unwrap();
+    let r = check(&map, &cells, offset, &opts).unwrap();
+    eprintln!(
+        "5:4 map → 3:2 shot: max |residual| {:.4} EV, peak-to-peak {:.4} EV, {} of {} cells",
+        r.max_abs,
+        r.peak_to_peak,
+        r.cells_used,
+        cells.means.len()
+    );
+    assert!(r.passes() && r.cells_used < cells.means.len());
+    assert!(r.after.ev.iter().any(|e| e.is_nan()), "cells outside the map have no residual");
+}
+
+#[test]
+fn another_sensor_or_an_unknown_position_is_refused() {
+    let (full, area) = windows();
+    let mut map = map_of(&clean(&radial(1.0, 0.5, 0.5), 26));
+    map.window = Some(full);
+    let other_body = SensorWindow { sensor: [W - 8, H], origin: [0, 0], size: [W - 8, H] };
+    assert!(map.placement([W - 8, H], Some(&other_body)).is_err());
+    assert!(map.relative_offset([W - 8, H], Some(&other_body)).is_err());
+    assert!(map.placement([1000, H], None).is_err(), "a smaller frame with no window");
+    assert!(map.placement([999, H], Some(&area)).is_err(), "a window that isn't the frame's size");
+    // the same active area needs no window
+    assert_eq!(map.placement([W, H], None).unwrap(), [0.0, 0.0]);
+}
+
+#[test]
+fn a_nearly_flat_field_gives_a_sane_centre_fit_or_none() {
+    let truth = radial(0.002, 0.5, 0.5);
+    let map = map_of(&clean(&truth, 27));
+    if let Some(f) = fit_centre(&map.ev_grid()) {
+        assert!(f.dx_pct.is_finite() && f.dy_pct.is_finite() && f.rms_ev.is_finite(), "{f:?}");
+        assert!(f.dx_pct.abs() <= 25.0 && f.dy_pct.abs() <= 25.0 && f.rms_ev < 0.01, "{f:?}");
+        assert!(!f.uneven(0.002));
+    }
+    // a constant field and a degenerate grid
+    let flat = EvGrid { sensor: [W, H], grid: [8, 6], ev: vec![0.0; 48] };
+    if let Some(f) = fit_centre(&flat) {
+        assert!(f.rms_ev.is_finite() && f.rms_ev < 1e-9, "{f:?}");
+    }
+    let tiny = EvGrid { sensor: [2, 2], grid: [2, 2], ev: vec![0.1; 4] };
+    let _ = fit_centre(&tiny);
+    // singular and near-singular systems give no solution, not garbage
+    assert_eq!(solve4([[1.0; 4]; 4], [1.0; 4]), None);
+    assert_eq!(solve4([[0.0; 4]; 4], [0.0; 4]), None);
+    let near = [[1.0, 1.0, 1.0, 1.0], [1.0, 1.0 + 1e-15, 1.0, 1.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]];
+    assert_eq!(solve4(near, [1.0; 4]), None);
+    assert_eq!(solve4([[f64::NAN; 4]; 4], [1.0; 4]), None);
+    // a regular system is solved
+    let x = solve4([[2.0, 0.0, 0.0, 1.0], [0.0, 3.0, 0.0, 0.0], [0.0, 0.0, 4.0, 0.0], [1.0, 0.0, 0.0, 2.0]], [3.0, 3.0, 4.0, 3.0]).unwrap();
+    for (a, b) in x.iter().zip([1.0, 1.0, 1.0, 1.0]) {
+        assert!((a - b).abs() < 1e-12, "{x:?}");
+    }
+}
+
+#[test]
+fn unevenness_is_judged_relative_to_the_falloff() {
+    let fit = |rms_ev| CentreFit { dx_pct: 0.0, dy_pct: 0.0, rms_ev };
+    assert!(!fit(0.029).uneven(0.5), "0.03 EV is the floor");
+    assert!(fit(0.031).uneven(0.5));
+    assert!(!fit(0.05).uneven(3.5), "2 % of a 3.5 EV fall-off is 0.07 EV");
+    assert!(fit(0.08).uneven(3.5));
+    assert!(fit(f64::NAN).uneven(1.0));
+}
+
+/// A check's residual grid marks cells the map doesn't cover with NaN; sampling it anywhere, including the
+/// extrapolated border next to such cells, must not panic (`f64::clamp` panics on a NaN bound).
+#[test]
+fn sampling_a_grid_with_missing_cells_never_panics() {
+    let mut ev = vec![0.1; 6 * 4];
+    for i in [0, 5, 6, 11, 18, 23] {
+        ev[i] = f64::NAN;
+    }
+    let g = EvGrid { sensor: [600, 400], grid: [6, 4], ev };
+    for (x, y) in [(0.0, 0.0), (600.0, 0.0), (0.0, 400.0), (600.0, 400.0), (300.0, 200.0), (5.0, 200.0), (-1e9, f64::NAN), (f64::INFINITY, 3.0)] {
+        let _ = g.at(x, y);
+    }
+    let all = EvGrid { sensor: [600, 400], grid: [6, 4], ev: vec![f64::NAN; 24] };
+    assert!(all.at(0.0, 0.0).is_nan());
 }
