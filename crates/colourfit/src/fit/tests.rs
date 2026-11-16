@@ -64,6 +64,7 @@ fn synthetic(model: &Model, lut: &pipe::Lut) -> Vec<PhotoSamples> {
                 white: White { neutral: n, lightroom_temp_tint: Some((t, 0.0)), baseline_exposure: 0.0 },
                 samples,
                 held_out: i % 5 == 0,
+                rank: (i, temps.len()),
                 raw_path: PathBuf::new(),
                 export_path: PathBuf::new(),
                 dng: None,
@@ -86,6 +87,27 @@ fn fit_recovers_a_known_profile() {
     assert!(e.after.median < e.before.median);
     let json = cal.to_json().unwrap();
     assert!(!json.contains("TESTCAM/") && !json.contains("raw_path"));
+}
+
+#[test]
+fn one_value_division_is_the_single_step_fit_and_more_give_a_valid_map() {
+    let (model, tone) = truth();
+    let lut = lut_for(&tone).unwrap();
+    let photos = synthetic(&model, &lut);
+    let opts = FitOptions { contributor: Some("Test".into()), rounds: 2, ..Default::default() };
+    let off = fit(&photos, &opts).unwrap();
+    let one = fit(&photos, &FitOptions { value_divisions: 1, report_warm: true, ..opts.clone() }).unwrap();
+    assert_eq!(off.to_json().unwrap(), one.to_json().unwrap(), "N = 1 is the fit without value divisions");
+    let six = fit(&photos, &FitOptions { value_divisions: 6, ..opts.clone() }).unwrap();
+    six.validate().unwrap();
+    let maps = six.camera.hue_sat_map.as_ref().unwrap();
+    assert!(maps.iter().all(|t| t.val_divisions == 6 && t.srgb_value && t.data.len() == table::HUES * table::SATS * 6));
+    let (hue, sat) = value_steepness(&six);
+    assert!(hue.is_finite() && sat.is_finite());
+    assert_eq!(value_steepness(&off), (0.0, 0.0));
+    let e = &six.evidence.looks[0];
+    assert!(e.after.median < e.before.median, "{e:?}");
+    assert!(fit(&photos, &FitOptions { value_divisions: MAX_VALUE_DIVISIONS + 1, ..opts }).is_err());
 }
 
 #[test]

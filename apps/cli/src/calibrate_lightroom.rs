@@ -250,6 +250,15 @@ fn fit_cmd(args: &[String]) -> Result<(), String> {
     let mut dry_run = false;
     let mut lens = None;
     let mut editor = calibration::Editor::Lightroom;
+    let mut value_divisions: Vec<usize> = Vec::new();
+    let mut folds: Option<usize> = None;
+    let mut allow_steep = false;
+    let mut all_photos_profiles = false;
+    let mut value_ending: Option<fit::ValueEnding> = None;
+    let (mut low_sat_fade, mut bright_smooth): (Option<f64>, Option<f64>) = (None, None);
+    let mut support_fade = false;
+    let mut blue_pull = false;
+    let (mut table_curvature, mut photo_cap) = (0.0f64, 0.0f64);
     // `--raws A B --exports C D`: plain arguments go to the list the last flag opened
     let mut list: Option<bool> = None; // Some(true) = raws, Some(false) = exports
     let mut i = 0;
@@ -261,6 +270,62 @@ fn fit_cmd(args: &[String]) -> Result<(), String> {
             "--contributor" => contributor = Some(take(args, &mut i, "--contributor")?.to_string()),
             "--dry-run" => dry_run = true,
             "--lens" => lens = Some(take(args, &mut i, "--lens")?.to_string()),
+            "--value-divisions" => {
+                let v = take(args, &mut i, "--value-divisions")?;
+                for part in v.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+                    let n: usize = part.parse().map_err(|_| format!("--value-divisions: `{part}` is not a number"))?;
+                    if !(1..=fit::MAX_VALUE_DIVISIONS).contains(&n) {
+                        return Err(format!("--value-divisions: {n} is not between 1 and {}", fit::MAX_VALUE_DIVISIONS));
+                    }
+                    value_divisions.push(n);
+                }
+            }
+            "--folds" => {
+                let v = take(args, &mut i, "--folds")?;
+                folds = Some(v.parse().ok().filter(|n| *n >= 1).ok_or_else(|| format!("--folds: `{v}` is not a number of folds (1 or more)"))?);
+            }
+            "--allow-steep" => allow_steep = true,
+            "--all-photos-profiles" => all_photos_profiles = true,
+            "--value-support-fade" => support_fade = true,
+            "--value-blue-pull" => blue_pull = true,
+            "--table-smooth" => {
+                let v = take(args, &mut i, "--table-smooth")?;
+                table_curvature = v
+                    .parse()
+                    .ok()
+                    .filter(|x: &f64| x.is_finite() && (0.0..=10000.0).contains(x))
+                    .ok_or_else(|| format!("--table-smooth: `{v}` is not a number from 0 to 10000"))?;
+            }
+            "--photo-cap" => {
+                let v = take(args, &mut i, "--photo-cap")?;
+                photo_cap = v
+                    .parse()
+                    .ok()
+                    .filter(|x: &f64| x.is_finite() && (0.0..1.0).contains(x))
+                    .ok_or_else(|| format!("--photo-cap: `{v}` is not a share from 0 to below 1"))?;
+            }
+            "--value-low-sat-fade" | "--value-bright-smooth" => {
+                let flag = args[i].clone();
+                let v = take(args, &mut i, &flag)?;
+                let x: f64 = v
+                    .parse()
+                    .ok()
+                    .filter(|x: &f64| x.is_finite() && (0.0..=50.0).contains(x))
+                    .ok_or_else(|| format!("{flag}: `{v}` is not a number from 0 to 50"))?;
+                if flag == "--value-low-sat-fade" {
+                    if x > 1.0 {
+                        return Err(format!("{flag}: `{v}` is a saturation, from 0 to 1"));
+                    }
+                    low_sat_fade = Some(x);
+                } else {
+                    bright_smooth = Some(x);
+                }
+            }
+            "--value-ending" => {
+                let v = take(args, &mut i, "--value-ending")?;
+                value_ending =
+                    Some(fit::ValueEnding::parse(v).ok_or_else(|| format!("--value-ending: `{v}` is not one of pin, fade, hold, hold-sat"))?);
+            }
             "--editor" => {
                 let v = take(args, &mut i, "--editor")?;
                 editor = calibration::Editor::parse(v).ok_or_else(|| {
@@ -279,6 +344,17 @@ fn fit_cmd(args: &[String]) -> Result<(), String> {
     }
     if raw_dirs.is_empty() || export_dirs.is_empty() {
         return Err(format!("fit needs --raws DIR… and --exports DIR… (folders of {} exports, searched with their subfolders)", editor.name()));
+    }
+    value_divisions.retain(|n| *n > 1);
+    value_divisions.sort_unstable();
+    value_divisions.dedup();
+    if folds.is_some() && value_divisions.is_empty() {
+        return Err("--folds compares value divisions: give --value-divisions N[,N…] (above 1) with it".into());
+    }
+    if (allow_steep || all_photos_profiles || value_ending.is_some() || low_sat_fade.is_some() || bright_smooth.is_some() || support_fade || blue_pull)
+        && value_divisions.is_empty()
+    {
+        return Err("--allow-steep, --all-photos-profiles and the --value-… options apply to value divisions: give --value-divisions N[,N…] (above 1) with them".into());
     }
     let mut raws = Vec::new();
     for d in &raw_dirs {
@@ -314,26 +390,30 @@ fn fit_cmd(args: &[String]) -> Result<(), String> {
         eprintln!("calibrate-lightroom: dry run, nothing fitted or written");
         return Ok(());
     }
-    eprintln!("calibrate-lightroom: fitting (this can take a few minutes)…");
-    let mut cal = fit::fit(&photos, &FitOptions { contributor, editor, rounds: 0 }).map_err(|e| e.to_string())?;
-    cal.tool_version = env!("CARGO_PKG_VERSION").to_string();
+    let mut cal = if value_divisions.is_empty() {
+        eprintln!("calibrate-lightroom: fitting (this can take a few minutes)…");
+        fit_once(&photos, &FitOptions { contributor, editor, rounds: 0, table_curvature, photo_cap, ..Default::default() })?
+    } else {
+        let folds = folds.unwrap_or(1).min(dataset::folds(CollectOptions::default().hold_out));
+        let opts = FitOptions {
+            contributor,
+            editor,
+            rounds: 0,
+            value_ending: value_ending.unwrap_or_default(),
+            value_low_sat_fade: low_sat_fade.unwrap_or(0.0),
+            value_bright_smooth: bright_smooth.unwrap_or(0.0),
+            value_support_fade: support_fade,
+            value_blue_pull: blue_pull,
+            table_curvature,
+            photo_cap,
+            ..Default::default()
+        };
+        value_division_search(photos, &opts, &value_divisions, folds, allow_steep, all_photos_profiles, &out)?
+    };
+    // the lens the calibration is for (`--lens`), set before validating as a plain fit always did
     cal.lens = lens;
     cal.validate().map_err(|e| format!("the fit produced an invalid calibration: {e}"))?;
-    std::fs::create_dir_all(&out).map_err(|e| format!("{}: {e}", out.display()))?;
-    let json_path = out.join(cal.file_name());
-    std::fs::write(&json_path, cal.to_json().map_err(|e| e.to_string())?).map_err(|e| format!("{}: {e}", json_path.display()))?;
-    let mut dcps = Vec::new();
-    for look in &cal.looks {
-        let dcp = cal.look_dcp(look);
-        let bytes = write_dcp(&dcp.model, &dcp.name, &dcp.copyright, &dcp.color)?;
-        let stem = json_path.file_stem().and_then(|s| s.to_str()).unwrap_or("calibration");
-        // the id without its `cal:` prefix: `:` is not allowed in Windows file names
-        let id = calibration::look_id(&look.name);
-        let slug = id.strip_prefix(calibration::LOOK_PREFIX).unwrap_or(&id);
-        let path = out.join(format!("{stem}.{slug}.dcp"));
-        std::fs::write(&path, bytes).map_err(|e| format!("{}: {e}", path.display()))?;
-        dcps.push(path);
-    }
+    let (json_path, dcps) = write_calibration(&cal, &out)?;
     print_contents(&cal);
     println!();
     println!("Send this file: {}", json_path.display());
@@ -354,6 +434,401 @@ fn fit_cmd(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// One fit, stamped with this tool's version and validated.
+fn fit_once(photos: &[dataset::PhotoSamples], opts: &FitOptions) -> Result<Calibration, String> {
+    let mut cal = fit::fit(photos, opts).map_err(|e| e.to_string())?;
+    cal.tool_version = env!("CARGO_PKG_VERSION").to_string();
+    cal.validate().map_err(|e| format!("the fit produced an invalid calibration: {e}"))?;
+    Ok(cal)
+}
+
+/// Write the calibration JSON and one `.dcp` per look into `out`: (JSON path, `.dcp` paths).
+fn write_calibration(cal: &Calibration, out: &Path) -> Result<(PathBuf, Vec<PathBuf>), String> {
+    std::fs::create_dir_all(out).map_err(|e| format!("{}: {e}", out.display()))?;
+    let json_path = out.join(cal.file_name());
+    std::fs::write(&json_path, cal.to_json().map_err(|e| e.to_string())?).map_err(|e| format!("{}: {e}", json_path.display()))?;
+    let mut dcps = Vec::new();
+    for look in &cal.looks {
+        let dcp = cal.look_dcp(look);
+        let bytes = write_dcp(&dcp.model, &dcp.name, &dcp.copyright, &dcp.color)?;
+        let stem = json_path.file_stem().and_then(|s| s.to_str()).unwrap_or("calibration");
+        // the id without its `cal:` prefix: `:` is not allowed in Windows file names
+        let id = calibration::look_id(&look.name);
+        let slug = id.strip_prefix(calibration::LOOK_PREFIX).unwrap_or(&id);
+        let path = out.join(format!("{stem}.{slug}.dcp"));
+        std::fs::write(&path, bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+        dcps.push(path);
+    }
+    Ok((json_path, dcps))
+}
+
+/// A fit's held-out score: the base look's ΔE00 median and p95, and how steeply its hue/saturation map changes per
+/// stop of brightness at [`STOP_QUANTILE`] of its cells (the measure [`STOP_LIMIT_WARM`] and [`STOP_LIMIT_BLUE`] apply
+/// to).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FoldScore {
+    median: f64,
+    p95: f64,
+    steep: fit::StopSteepness,
+    /// How far its near-white tints are from the same fold's single-step fit ([`fit::near_white_shift`] at
+    /// [`STOP_QUANTILE`]; 0 for the single-step fit itself).
+    near_white: f64,
+    /// The worst photo's noise excess of its maps ([`fit::noise_excess`], over every photo of the fold).
+    noise: f64,
+}
+
+fn score_of(cal: &Calibration, single_step: Option<&Calibration>, photos: &[dataset::PhotoSamples]) -> Option<FoldScore> {
+    let l = cal.evidence.looks.iter().filter(|l| l.held_out > 0).max_by_key(|l| l.photos)?;
+    Some(FoldScore {
+        median: f64::from(l.after.median),
+        p95: f64::from(l.after.p95),
+        steep: fit::value_steepness_per_stop(cal, STOP_QUANTILE),
+        near_white: single_step.map_or(0.0, |b| fit::near_white_shift(cal, b, STOP_QUANTILE)),
+        noise: fit::noise_excess(cal, photos).0,
+    })
+}
+
+// The noise excess ([`fit::noise_excess`]) is reported, not part of the rule: on the Z 8 data, measured on the training
+// samples, it names the photo a mottled fit is worst on (a haze photo whose own colours sit in a cell that jumps away
+// from its neighbours), but it also scores fits that render that photo cleanly nearly as high (a misty sea photo at
+// 1.65 against 2.10 for the mottled fit), so no limit separates the two yet. Full-size renders of the named photos
+// (flat-patch noise against the built-in profile) are the check that does.
+
+/// A value-division candidate loses a single fold by a clear margin when it is worse than the single-step map there by
+/// more than this much ΔE00 (median, p95).
+const FOLD_MARGIN: (f64, f64) = (0.10, 0.25);
+/// The steepness rule's measure: this quantile of the map's per-stop changes (cells pooled over both illuminant maps and
+/// every value step but the one from black, [`fit::value_steepness_per_stop`]) must stay within the limits below in
+/// every fold (the worst fold counts, not the mean).
+const STOP_QUANTILE: f64 = 0.99;
+/// Steepest change per stop of brightness the oranges/yellows may have (hue °/stop, |ln saturation ratio|/stop):
+/// Capture One's own 99th percentile, 4.6° and 0.28, measured from exports of the same photos at −1, 0 and +1 EV, plus
+/// 25 %. The reference comes from 5 scenes, and the 25 % tolerance is a judgement call.
+const STOP_LIMIT_WARM: (f64, f64) = (5.75, 0.35);
+/// As [`STOP_LIMIT_WARM`] for the blues: Capture One's 3.0° and 0.24 plus 25 %, measured on a single dusk sky.
+const STOP_LIMIT_BLUE: (f64, f64) = (3.75, 0.30);
+/// Furthest a candidate may move near-white tints from the same fold's single-step fit ([`fit::near_white_shift`] at
+/// [`STOP_QUANTILE`], ΔE*ab of a*b*), in every fold. Bright near-neutrals (clouds, highlights) have almost no training
+/// samples and no Capture One reference in the exposure series, so the brightness-dependent part should leave them
+/// about where the single-step map puts them. The limit is a judgement call: about a just-noticeable tint difference.
+const NEAR_WHITE_LIMIT: f64 = 2.0;
+
+fn within_stop_limits(s: &fit::StopSteepness) -> bool {
+    s.warm.0 <= STOP_LIMIT_WARM.0 && s.warm.1 <= STOP_LIMIT_WARM.1 && s.blue.0 <= STOP_LIMIT_BLUE.0 && s.blue.1 <= STOP_LIMIT_BLUE.1
+}
+
+fn stop_text(s: &fit::StopSteepness) -> String {
+    format!(
+        "warm {:.2}°/{:.3}, blue {:.2}°/{:.3} per stop (limits {}°/{}, {}°/{})",
+        s.warm.0, s.warm.1, s.blue.0, s.blue.1, STOP_LIMIT_WARM.0, STOP_LIMIT_WARM.1, STOP_LIMIT_BLUE.0, STOP_LIMIT_BLUE.1
+    )
+}
+/// How much lower a larger candidate's mean held-out p95 must be to be chosen over a smaller one that also passes.
+const CLEARLY_BETTER_P95: f64 = 0.15;
+
+fn mean(v: impl Iterator<Item = f64>) -> f64 {
+    let (s, n) = v.fold((0.0, 0usize), |(s, n), x| (s + x, n + 1));
+    if n == 0 { f64::NAN } else { s / n as f64 }
+}
+
+/// Choose the value divisions from per-fold scores (`scores[k][fold]`, `scores[0]` the single-step fit): a candidate
+/// must have every fold, beat the single-step fit on the mean median and the mean p95, not lose any fold by
+/// [`FOLD_MARGIN`], and stay within [`STOP_LIMIT_WARM`] and [`STOP_LIMIT_BLUE`] in every fold; of those that pass the smallest is chosen unless
+/// a larger one's mean p95 is [`CLEARLY_BETTER_P95`] lower. Returns the chosen divisions (1 when none passes), one
+/// line per candidate saying why, and the candidates that fail the steepness check and nothing else.
+fn choose_value_divisions(ns: &[usize], scores: &[Vec<Option<FoldScore>>]) -> (usize, Vec<String>, Vec<usize>) {
+    let mut why = Vec::new();
+    let mut steep_only = Vec::new();
+    let Some(base) = scores.first() else { return (1, why, steep_only) };
+    if base.iter().any(Option::is_none) {
+        why.push("the single-step fit failed in a fold, so nothing can be compared with it".into());
+        return (1, why, steep_only);
+    }
+    let base: Vec<FoldScore> = base.iter().flatten().copied().collect();
+    let (bm, bp) = (mean(base.iter().map(|s| s.median)), mean(base.iter().map(|s| s.p95)));
+    let mut passing: Vec<(usize, f64)> = Vec::new();
+    for (n, sc) in ns.iter().zip(scores).skip(1) {
+        if sc.iter().any(Option::is_none) || sc.len() != base.len() {
+            why.push(format!("N={n}: a fold failed to fit"));
+            continue;
+        }
+        let sc: Vec<FoldScore> = sc.iter().flatten().copied().collect();
+        let (m, p) = (mean(sc.iter().map(|s| s.median)), mean(sc.iter().map(|s| s.p95)));
+        let mut fails = Vec::new();
+        let mut steep = false;
+        let mut steep_folds = Vec::new();
+        if m.partial_cmp(&bm) != Some(std::cmp::Ordering::Less) {
+            fails.push(format!("mean median {m:.3} not below {bm:.3}"));
+        }
+        if p.partial_cmp(&bp) != Some(std::cmp::Ordering::Less) {
+            fails.push(format!("mean p95 {p:.3} not below {bp:.3}"));
+        }
+        for (f, (s, b)) in sc.iter().zip(&base).enumerate() {
+            if s.median > b.median + FOLD_MARGIN.0 || s.p95 > b.p95 + FOLD_MARGIN.1 {
+                fails.push(format!("fold {f} lost clearly (median {:.2} vs {:.2}, p95 {:.2} vs {:.2})", s.median, b.median, s.p95, b.p95));
+            }
+            if !within_stop_limits(&s.steep) {
+                steep = true;
+                steep_folds.push(format!("fold {f}: {}", stop_text(&s.steep)));
+            }
+            if s.near_white > NEAR_WHITE_LIMIT {
+                steep = true;
+                steep_folds.push(format!("fold {f}: near-white tints {:.2} ΔE*ab from the single-step fit (limit {NEAR_WHITE_LIMIT})", s.near_white));
+            }
+        }
+        let accurate = fails.is_empty();
+        if steep {
+            fails.push(format!("too steep per stop (99th percentile) in {}", steep_folds.join("; ")));
+            if accurate {
+                steep_only.push(*n);
+            }
+        }
+        if fails.is_empty() {
+            why.push(format!("N={n}: passes (mean median {m:.3} vs {bm:.3}, mean p95 {p:.3} vs {bp:.3})"));
+            passing.push((*n, p));
+        } else {
+            why.push(format!("N={n}: fails: {}", fails.join("; ")));
+        }
+    }
+    let mut chosen: Option<(usize, f64)> = None;
+    for (n, p) in passing {
+        chosen = match chosen {
+            Some((cn, cp)) if p > cp - CLEARLY_BETTER_P95 => Some((cn, cp)),
+            _ => Some((n, p)),
+        };
+    }
+    (chosen.map_or(1, |c| c.0), why, steep_only)
+}
+
+/// `--value-divisions N[,N…] [--folds K]`: fit the single-step map and each candidate on every fold, print the
+/// per-fold held-out numbers, choose by [`choose_value_divisions`] and return the chosen fit of fold 0 (the default
+/// hold-out). Every fit is also written to `out/value-divisions/fold-K/N…` for inspection.
+fn value_division_search(
+    mut photos: Vec<dataset::PhotoSamples>,
+    opts: &FitOptions,
+    candidates: &[usize],
+    folds: usize,
+    allow_steep: bool,
+    all_photos_profiles: bool,
+    out: &Path,
+) -> Result<Calibration, String> {
+    let share = CollectOptions::default().hold_out;
+    let mut ns = vec![1];
+    ns.extend_from_slice(candidates);
+    let mut scores: Vec<Vec<Option<FoldScore>>> = vec![Vec::new(); ns.len()];
+    let mut fold0: Vec<Option<Calibration>> = vec![None; ns.len()];
+    for fold in 0..folds.max(1) {
+        dataset::hold_out_fold(&mut photos, share, fold);
+        // this fold's single-step fit, which the candidates' near-white tints are compared with
+        let mut single_step: Option<Calibration> = None;
+        for (k, &n) in ns.iter().enumerate() {
+            eprintln!("calibrate-lightroom: fold {}/{} N={n}: fitting…", fold + 1, folds.max(1));
+            // every fit is scored against the others, even one that wouldn't beat the app's current colour on this
+            // fold; the gate is applied to the one written at the end
+            let o = FitOptions { value_divisions: n, report_warm: true, keep_ungated: true, ..opts.clone() };
+            let got = match fit_once(&photos, &o) {
+                Ok(cal) => {
+                    let dir = out.join("value-divisions").join(format!("fold-{fold}")).join(format!("N{n}"));
+                    write_calibration(&cal, &dir)?;
+                    let s = score_of(&cal, if n == 1 { None } else { single_step.as_ref() }, &photos);
+                    if n == 1 {
+                        single_step = Some(cal.clone());
+                    }
+                    if let Some(s) = s {
+                        let max = fit::value_steepness_per_stop(&cal, 1.0);
+                        eprintln!(
+                            "calibrate-lightroom: fold {fold} N={n}: held-out ΔE00 median {:.2}, p95 {:.2}{}; steepness 99th percentile {}{}; \
+                             largest warm {:.2}°/{:.3}, blue {:.2}°/{:.3} per stop; near-white tints {:.2} ΔE*ab from the single-step fit{}; \
+                             noise excess {:.2} on the worst photo (reported, not a rule)",
+                            s.median,
+                            s.p95,
+                            if fit::beats_current_colour(&cal) { "" } else { " (does not beat the app's current colour)" },
+                            stop_text(&s.steep),
+                            if within_stop_limits(&s.steep) { "" } else { " TOO STEEP" },
+                            max.warm.0,
+                            max.warm.1,
+                            max.blue.0,
+                            max.blue.1,
+                            s.near_white,
+                            if s.near_white > NEAR_WHITE_LIMIT { " TOO FAR" } else { "" },
+                            s.noise
+                        );
+                        // the photos it is worst on (local console only, like the skipped-file list)
+                        let worst: Vec<String> = fit::noise_excess_per_photo(&cal, &photos)
+                            .iter()
+                            .take(3)
+                            .map(|(i, e)| format!("{} {e:.2}", photos[*i].raw_path.file_name().map_or_else(String::new, |f| f.to_string_lossy().into_owned())))
+                            .collect();
+                        eprintln!("calibrate-lightroom: fold {fold} N={n}: noise excess worst photos: {}", worst.join(", "));
+                    }
+                    if fold == 0
+                        && let Some(slot) = fold0.get_mut(k)
+                    {
+                        *slot = Some(cal);
+                    }
+                    s
+                }
+                Err(e) => {
+                    eprintln!("calibrate-lightroom: fold {fold} N={n}: no fit: {e}");
+                    None
+                }
+            };
+            if let Some(v) = scores.get_mut(k) {
+                v.push(got);
+            }
+        }
+    }
+    println!("Held-out ΔE00 per fold (median / p95):");
+    for (n, sc) in ns.iter().zip(&scores) {
+        let cells: Vec<String> = sc.iter().map(|s| s.map_or("   failed   ".into(), |s| format!("{:5.2} / {:5.2}", s.median, s.p95))).collect();
+        let ok: Vec<FoldScore> = sc.iter().flatten().copied().collect();
+        println!("  N={n:<2} {}  | mean {:.2} / {:.2}", cells.join("  "), mean(ok.iter().map(|s| s.median)), mean(ok.iter().map(|s| s.p95)));
+    }
+    if folds <= 1 {
+        println!("  (one held-out split only: pass --folds 5 for a decision that doesn't rest on one choice of photos)");
+    }
+    let (chosen, why, steep_only) = choose_value_divisions(&ns, &scores);
+    for w in &why {
+        println!("  {w}");
+    }
+    if allow_steep {
+        write_steep(&photos, opts, &steep_only, &out.join("steep"))?;
+    }
+    if all_photos_profiles {
+        for &n in candidates {
+            let passes = why.iter().any(|w| w.starts_with(&format!("N={n}: passes")));
+            let rule = if passes { "passes-rule" } else { "fails-rule" };
+            let words = if passes { "passes the rule" } else { "fails the rule" };
+            let label = variant_label(opts, n);
+            let (path, name, p99) = write_all_photos_fit(
+                &photos,
+                opts,
+                n,
+                &out.join("all-photos"),
+                &format!("{label}.{rule}.all-photos-not-held-out-checked"),
+                &format!("{label}, {words}, all photos, not checked on held-out photos"),
+            )?;
+            println!(
+                "ALL-PHOTOS TEST PROFILE ({words}; not checked on held-out photos): {}\n  profile name \"{name}\"; steepness 99th percentile {}",
+                path.display(),
+                stop_text(&p99)
+            );
+        }
+    }
+    let k = ns.iter().position(|n| *n == chosen).unwrap_or(0);
+    let cal = fold0.get_mut(k).and_then(Option::take).or_else(|| fold0.first_mut().and_then(Option::take));
+    let cal = cal.ok_or_else(|| "the single-step fit of the default hold-out failed".to_string())?;
+    // the written fit passes the gate a plain fit applies
+    if !fit::beats_current_colour(&cal) {
+        return Err(format!(
+            "the {} fit of the default hold-out does not beat the app's current colour on its held-out photos: nothing written \
+             (the per-fold fits are in {})",
+            if chosen == 1 { "single-step".to_string() } else { format!("N={chosen}") },
+            out.join("value-divisions").display()
+        ));
+    }
+    if chosen == 1 {
+        println!("Value divisions: none of {candidates:?} passed; writing the single-step fit (fold 0).");
+    } else {
+        println!("Value divisions: {chosen} chosen; writing its fit of the default hold-out (fold 0).");
+    }
+    Ok(cal)
+}
+
+/// A candidate's label in test-profile names: `N6-hold`, plus the experimental shape options when set
+/// (`-lowsat0.25`, `-bright8`).
+fn variant_label(opts: &FitOptions, n: usize) -> String {
+    let mut s = format!("N{n}-{}", opts.value_ending.id());
+    if opts.value_low_sat_fade > 0.0 {
+        s += &format!("-lowsat{}", opts.value_low_sat_fade);
+    }
+    if opts.value_bright_smooth > 0.0 {
+        s += &format!("-bright{}", opts.value_bright_smooth);
+    }
+    if opts.value_support_fade {
+        s += "-support";
+    }
+    if opts.value_blue_pull {
+        s += "-bluepull";
+    }
+    if opts.table_curvature > 0.0 {
+        s += &format!("-smooth{}", opts.table_curvature);
+    }
+    if opts.photo_cap > 0.0 {
+        s += &format!("-cap{}", opts.photo_cap);
+    }
+    s
+}
+
+/// `--all-photos-profiles`: candidate `n` fitted on every photo, none held out, written as `.dcp` files only into `dir`
+/// with `file_tag` in the file name and `(name_tag)` after the profile name, so it imports next to the profiles already
+/// there. Returns the (last) path, its profile name and its steepness.
+fn write_all_photos_fit(
+    photos: &[dataset::PhotoSamples],
+    opts: &FitOptions,
+    n: usize,
+    dir: &Path,
+    file_tag: &str,
+    name_tag: &str,
+) -> Result<(PathBuf, String, fit::StopSteepness), String> {
+    eprintln!("calibrate-lightroom: --all-photos-profiles: {name_tag}: fitting…");
+    let o = FitOptions { value_divisions: n, keep_ungated: true, all_photos: true, ..opts.clone() };
+    let cal = fit_once(photos, &o)?;
+    let p99 = fit::value_steepness_per_stop(&cal, STOP_QUANTILE);
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let mut last = (PathBuf::new(), String::new());
+    for look in &cal.looks {
+        let mut dcp = cal.look_dcp(look);
+        dcp.name = format!("{} ({name_tag})", dcp.name);
+        let bytes = write_dcp(&dcp.model, &dcp.name, &dcp.copyright, &dcp.color)?;
+        let id = calibration::look_id(&look.name);
+        let slug = id.strip_prefix(calibration::LOOK_PREFIX).unwrap_or(&id);
+        let stem = Path::new(&cal.file_name()).file_stem().and_then(|s| s.to_str()).unwrap_or("calibration").to_string();
+        let path = dir.join(format!("{stem}.{slug}.{file_tag}.dcp"));
+        std::fs::write(&path, bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+        last = (path, dcp.name);
+    }
+    Ok((last.0, last.1, p99))
+}
+
+/// `--allow-steep`: each candidate in `ns` (those that fail the steepness check and nothing else) fitted on every
+/// photo, none held out, and written as `.dcp` files only into `dir`, labelled in the file name and in the profile name
+/// (`… (N6 steep, untested)`), so they import next to the profiles already there instead of replacing one. No
+/// calibration JSON is written for them: they are not checked on held-out photos and are not for sending.
+fn write_steep(photos: &[dataset::PhotoSamples], opts: &FitOptions, ns: &[usize], dir: &Path) -> Result<(), String> {
+    if ns.is_empty() {
+        println!("--allow-steep: no candidate fails only the steepness check; no steep profiles written.");
+        return Ok(());
+    }
+    let ending = opts.value_ending;
+    for &n in ns {
+        eprintln!("calibrate-lightroom: --allow-steep: N={n} ({} ending), fitting on all photos…", ending.id());
+        let o = FitOptions { value_divisions: n, keep_ungated: true, all_photos: true, ..opts.clone() };
+        let cal = fit_once(photos, &o)?;
+        let p99 = fit::value_steepness_per_stop(&cal, STOP_QUANTILE);
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let label = variant_label(opts, n);
+        for look in &cal.looks {
+            let mut dcp = cal.look_dcp(look);
+            dcp.name = format!("{} ({label} steep, untested)", dcp.name);
+            let bytes = write_dcp(&dcp.model, &dcp.name, &dcp.copyright, &dcp.color)?;
+            let id = calibration::look_id(&look.name);
+            let slug = id.strip_prefix(calibration::LOOK_PREFIX).unwrap_or(&id);
+            let stem = Path::new(&cal.file_name()).file_stem().and_then(|s| s.to_str()).unwrap_or("calibration").to_string();
+            let path = dir.join(format!("{stem}.{slug}.STEEP-{label}-all-photos.dcp"));
+            std::fs::write(&path, bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+            println!(
+                "STEEP PROFILE (fails the steepness check, fitted on all photos, not checked on held-out photos): {}\n  \
+                 profile name \"{}\"; steepness 99th percentile {}",
+                path.display(),
+                dcp.name,
+                stop_text(&p99)
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Everything a calibration file holds, in words.
 fn print_contents(c: &Calibration) {
     println!("{} {}: calibration matched to {}", c.make, c.model, c.editor.name());
@@ -368,7 +843,11 @@ fn print_contents(c: &Calibration) {
     println!(
         "  camera colour model: illuminants {:?}, two colour and two forward matrices (3×3){}",
         c.camera.illuminants,
-        if c.camera.hue_sat_map.is_some() { ", two hue/saturation maps" } else { "" }
+        match &c.camera.hue_sat_map {
+            Some([t, _]) if t.val_divisions > 1 => format!(", two hue/saturation maps with {} brightness steps", t.val_divisions),
+            Some(_) => ", two hue/saturation maps".to_string(),
+            None => String::new(),
+        }
     );
     for l in &c.looks {
         println!(
@@ -536,6 +1015,45 @@ mod tests {
     use lcc_raw::Mat3;
     use lcc_raw::profile::ToneCurve;
 
+    fn sc(median: f64, p95: f64) -> Option<FoldScore> {
+        Some(FoldScore { median, p95, steep: fit::StopSteepness { warm: (4.0, 0.2), blue: (2.0, 0.2) }, near_white: 0.5, noise: 0.3 })
+    }
+
+    #[test]
+    fn value_divisions_are_chosen_across_folds() {
+        let base = vec![sc(2.0, 5.0), sc(2.1, 5.2), sc(1.9, 4.8)];
+        // N=4 better everywhere, N=6 a little better still on p95 but not clearly: the smaller one wins
+        let four = vec![sc(1.9, 4.7), sc(2.0, 4.9), sc(1.8, 4.6)];
+        let six = vec![sc(1.9, 4.6), sc(2.0, 4.8), sc(1.8, 4.6)];
+        assert_eq!(choose_value_divisions(&[1, 4, 6], &[base.clone(), four.clone(), six]).0, 4);
+        // clearly better on p95: the larger one wins
+        let six = vec![sc(1.85, 4.4), sc(1.95, 4.6), sc(1.75, 4.4)];
+        assert_eq!(choose_value_divisions(&[1, 4, 6], &[base.clone(), four.clone(), six]).0, 6);
+        // better on average but losing one fold by a clear margin: refused
+        let lumpy = vec![sc(1.5, 4.0), sc(2.3, 5.6), sc(1.5, 4.0)];
+        let (n, why, steep_only) = choose_value_divisions(&[1, 4], &[base.clone(), lumpy.clone()]);
+        assert_eq!(n, 1);
+        assert!(why.iter().any(|w| w.contains("fold 1 lost clearly")), "{why:?}");
+        assert!(steep_only.is_empty());
+        // too steep along value, or a failed fold: refused; only the steep one counts as failing on steepness alone
+        let steep = vec![
+            Some(FoldScore { steep: fit::StopSteepness { warm: (4.0, 0.36), blue: (2.0, 0.2) }, ..sc(1.5, 4.0).unwrap() }),
+            sc(1.5, 4.0),
+            sc(1.5, 4.0),
+        ];
+        let (n, _, steep_only) = choose_value_divisions(&[1, 4], &[base.clone(), steep.clone()]);
+        assert_eq!((n, steep_only), (1, vec![4]));
+        let steep_lumpy: Vec<Option<FoldScore>> =
+            lumpy.iter().map(|s| s.map(|s| FoldScore { steep: fit::StopSteepness { warm: (4.0, 0.2), blue: (3.8, 0.2) }, ..s })).collect();
+        assert!(choose_value_divisions(&[1, 4, 6], &[base.clone(), steep, steep_lumpy]).2 == vec![4]);
+        assert_eq!(choose_value_divisions(&[1, 4], &[base.clone(), vec![sc(1.0, 3.0), None, sc(1.0, 3.0)]]).0, 1);
+        // better on p95 but not on the median: refused
+        assert_eq!(choose_value_divisions(&[1, 4], &[base.clone(), vec![sc(2.05, 4.0), sc(2.15, 4.2), sc(1.95, 3.8)]]).0, 1);
+        // the single-step fit failing a fold leaves nothing to compare with
+        assert_eq!(choose_value_divisions(&[1, 4], &[vec![None, sc(2.0, 5.0)], vec![sc(1.0, 3.0), sc(1.0, 3.0)]]).0, 1);
+        assert_eq!(choose_value_divisions(&[], &[]).0, 1);
+    }
+
     #[test]
     fn written_profiles_parse_back() {
         let mut color = ColorData { illuminant: [17, 21], ..ColorData::default() };
@@ -561,6 +1079,19 @@ mod tests {
         assert!(d.color.profile.hue_sat_map[1].is_some());
         assert_eq!(d.color.profile.look_table.as_ref().map(|t| t.data.len()), Some(12));
         assert_eq!(d.color.profile.tone_curve.as_ref().map(|c| c.points.len()), Some(3));
+        // a map with value divisions keeps them and its sRGB-encoded value axis
+        let deep = lcc_raw::profile::HsvTable {
+            hue_divisions: 6,
+            sat_divisions: 2,
+            val_divisions: 4,
+            data: (0..48).map(|i| [i as f32 * 0.1, 1.0 + i as f32 * 0.01, 1.0]).collect(),
+            srgb_value: true,
+        };
+        color.profile.hue_sat_map = [Some(deep.clone()), Some(deep.clone())];
+        let d = lcc_raw::dcp::parse(&write_dcp("SONY ILCE-7M4", "Deep", "A Contributor", &color).unwrap()).unwrap();
+        let got = d.color.profile.hue_sat_map[0].as_ref().unwrap();
+        assert_eq!((got.val_divisions, got.srgb_value, got.data.len()), (4, true, 48));
+        assert!((got.data[47][0] - 4.7).abs() < 1e-4);
     }
 
     #[test]

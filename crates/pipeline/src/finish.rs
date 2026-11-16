@@ -884,6 +884,10 @@ pub(crate) fn finish_with<T: Copy + Default + Send>(
             if k != 1.0 {
                 d = d.map(|v| o + (v - o) * k);
             }
+            // prototype: the channel roll-off (opt-in, `<PREFIX>_TONE_ROLLOFF=channel`)
+            if tone.channel_rolloff() {
+                d = tone.roll_off_channel(d, yl, o);
+            }
             if let Some(rc) = rgb_contrast {
                 d = d.map(|v| rc.apply(v));
                 o = rc.apply(o);

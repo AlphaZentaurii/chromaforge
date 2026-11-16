@@ -26,6 +26,10 @@ const NO_CHROMA: [f32; CHROMA_N] = [1.0; CHROMA_N];
 pub struct CameraTone {
     knots: [[f32; 2]; 32],
     chroma: [f32; CHROMA_N],
+    /// Prototype (opt-in): the channel roll-off ([`ToneMap::channel_rolloff`]). Omitted when off, so tone curves
+    /// without it keep their JSON.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    channel: bool,
 }
 
 impl<'de> serde::Deserialize<'de> for CameraTone {
@@ -36,13 +40,65 @@ impl<'de> serde::Deserialize<'de> for CameraTone {
             // absent in smart previews written before the chroma curve existed
             #[serde(default)]
             chroma: Option<[f32; CHROMA_N]>,
+            #[serde(default)]
+            channel: bool,
         }
         let w = Wire::deserialize(d)?;
         let tone = Self::new(w.knots).ok_or_else(|| serde::de::Error::custom("invalid camera tone curve"))?;
+        let tone = if w.channel { tone.with_channel_rolloff() } else { tone };
         match w.chroma {
             Some(c) => tone.with_chroma(c).ok_or_else(|| serde::de::Error::custom("invalid camera chroma curve")),
             None => Ok(tone),
         }
+    }
+}
+
+/// Prototype: how a profile's tone curve rolls colour off toward white near the top (`<PREFIX>_TONE_ROLLOFF`):
+/// a luminance tone curve keeps colour ratios, so bright saturated colours stay saturated up to white, where a curve
+/// applied to each RGB channel (as most editors' profile curves are) bleaches them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColorRolloff {
+    /// None (the default; the output is unchanged).
+    Off,
+    /// A chroma curve over display lightness, derived from the tone curve ([`CameraTone::with_derived_chroma`]).
+    Lightness,
+    /// By how close the strongest channel is to the top ([`ToneMap::channel_rolloff`]).
+    Channel,
+}
+
+impl CameraTone {
+    /// The channel roll-off on ([`ToneMap::channel_rolloff`]).
+    pub fn with_channel_rolloff(self) -> Self {
+        Self { channel: true, ..self }
+    }
+
+    /// The lightness roll-off: a chroma curve from the curve's own shape. For a colour close to grey at scene
+    /// luminance Y, a per-channel curve f moves each channel by f′(Y)·Y·δ where the luminance curve moves it by
+    /// f(Y)·δ, so per channel its chroma is scaled by the curve's log-log slope Y·f′(Y) / f(Y) at Y. Only where that is
+    /// below 1 (the shoulder: bleaching); a toe or a steep midtone (above 1) is left alone, because the profile's colour
+    /// tables were fitted with this luminance curve and already carry the midtone saturation.
+    pub fn with_derived_chroma(self, strength: f32) -> Self {
+        let mut chroma = NO_CHROMA;
+        for (j, k) in chroma.iter_mut().enumerate() {
+            // display luminance of this node (just below white for the last one), its scene luminance on the curve
+            let o = (j as f32 / (CHROMA_N - 1) as f32).min(0.995);
+            if o <= 0.0 {
+                continue;
+            }
+            let (mut lo, mut hi) = (1e-6f32, 64.0f32);
+            for _ in 0..60 {
+                let m = (lo * hi).sqrt();
+                if self.apply(m) < o { lo = m } else { hi = m }
+            }
+            let y = (lo * hi).sqrt();
+            let h = 2f32.powf(0.1);
+            let (a, b) = (self.apply(y / h), self.apply(y * h));
+            if a > 0.0 && b > 0.0 {
+                let slope = (b / a).ln() / (2.0 * 0.1 * std::f32::consts::LN_2);
+                *k = 1.0 - strength.clamp(0.0, 1.0) * (1.0 - slope.clamp(0.0, 1.0));
+            }
+        }
+        Self { chroma, ..self }
     }
 }
 
@@ -55,7 +111,7 @@ impl CameraTone {
             }
             previous = p;
         }
-        Some(Self { knots, chroma: NO_CHROMA })
+        Some(Self { knots, chroma: NO_CHROMA, channel: false })
     }
 
     /// The default raw tone curve ([`ToneMap::new`] at neutral settings) as camera-curve knots, about 1/3 EV apart
@@ -194,6 +250,8 @@ const HDR_FROM_EV: f32 = 1.5;
 pub struct ToneMap {
     lut: Vec<f32>,
     chroma: [f32; CHROMA_N],
+    /// Prototype: the channel roll-off ([`ToneMap::roll_off_channel`]).
+    channel: bool,
 }
 
 impl ToneMap {
@@ -206,13 +264,13 @@ impl ToneMap {
     /// gain map only lifts highlights), then the highlights gain up to `peak − 1` more as in
     /// [`ToneMap::hdr`].
     pub fn camera_hdr(curve: &CameraTone, contrast: f64, whites: f64, blacks: f64, peak: f32) -> ToneMap {
-        ToneMap::camera_with(|y| curve.apply(y), curve.chroma, contrast, whites, blacks, peak)
+        ToneMap::camera_with(|y| curve.apply(y), curve.chroma, contrast, whites, blacks, peak).with_channel(curve.channel)
     }
 
     /// [`ToneMap::camera_hdr`] of process V8: past its last knot the camera curve rolls off in stops
     /// ([`CameraTone::apply_rolloff`]) instead of closing on white within a stop of the sensor's.
     pub fn camera_rolloff_hdr(curve: &CameraTone, contrast: f64, whites: f64, blacks: f64, peak: f32) -> ToneMap {
-        ToneMap::camera_with(|y| curve.apply_rolloff(y), curve.chroma, contrast, whites, blacks, peak)
+        ToneMap::camera_with(|y| curve.apply_rolloff(y), curve.chroma, contrast, whites, blacks, peak).with_channel(curve.channel)
     }
 
     fn camera_with(curve: impl Fn(f32) -> f32, chroma: [f32; CHROMA_N], contrast: f64, whites: f64, blacks: f64, peak: f32) -> ToneMap {
@@ -228,7 +286,7 @@ impl ToneMap {
                 if peak > 1.0 { (o + (peak - 1.0) * smooth(HDR_FROM_EV, top, ev)).clamp(0.0, peak) } else { o }
             })
             .collect();
-        ToneMap { lut, chroma }
+        ToneMap { lut, chroma, channel: false }
     }
     /// `contrast`, `whites`, `blacks` in −100..100 (Lightroom slider units).
     pub fn new(contrast: f64, whites: f64, blacks: f64) -> ToneMap {
@@ -292,7 +350,7 @@ impl ToneMap {
                 o.clamp(0.0, peak)
             })
             .collect();
-        ToneMap { lut, chroma: NO_CHROMA }
+        ToneMap { lut, chroma: NO_CHROMA, channel: false }
     }
 
     /// Tone map for display-referred sources: identity at neutral settings.
@@ -338,7 +396,7 @@ impl ToneMap {
                 o.clamp(0.0, peak)
             })
             .collect();
-        ToneMap { lut: monotone(lut), chroma: NO_CHROMA }
+        ToneMap { lut: monotone(lut), chroma: NO_CHROMA, channel: false }
     }
 
     /// Fits an HDR tone map reaching `peak` into SDR (own design, issue #69). Display values up to
@@ -373,6 +431,31 @@ impl ToneMap {
     /// The chroma curve (`CHROMA_N` entries, see [`ToneMap::chroma_scale`]).
     pub fn chroma_lut(&self) -> &[f32] {
         &self.chroma
+    }
+
+    fn with_channel(self, channel: bool) -> Self {
+        Self { channel, ..self }
+    }
+
+    /// Prototype: whether the channel roll-off is on ([`ToneMap::roll_off_channel`]).
+    pub fn channel_rolloff(&self) -> bool {
+        self.channel
+    }
+
+    /// The channel roll-off of a colour `d` (display-linear, after this map on luminance) whose scene luminance was
+    /// `y` and display luminance is `o`: its strongest channel m stood at scene value m·y/o, and a curve applied to
+    /// each channel would put it at `apply(m·y/o)`; the colour is moved toward grey `o` (hue and lightness kept) until
+    /// its strongest channel is there. Only ever toward grey (a toe would saturate, which the profile's colour tables
+    /// already account for), and nothing for a neutral (m = o).
+    #[inline]
+    pub fn roll_off_channel(&self, d: [f32; 3], y: f32, o: f32) -> [f32; 3] {
+        let m = d[0].max(d[1]).max(d[2]);
+        if !(y > 1e-9 && o > 1e-6 && m > o * 1.0001 && m.is_finite()) {
+            return d;
+        }
+        let target = self.apply(m * y / o);
+        let k = ((target - o) / (m - o)).clamp(0.0, 1.0);
+        if k >= 1.0 { d } else { d.map(|v| o + (v - o) * k) }
     }
 
     /// Chroma scale at display luminance `o` (exactly 1 everywhere unless a camera look sets it).

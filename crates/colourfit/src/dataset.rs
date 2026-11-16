@@ -68,6 +68,9 @@ pub struct PhotoSamples {
     pub samples: Vec<Sample>,
     /// Held out for validation (not fitted on).
     pub held_out: bool,
+    /// The raw's place in the hold-out order (capture time, then path) and the number of raws in it, so the held-out
+    /// share can be moved to another fold ([`hold_out_fold`]) without collecting again.
+    pub rank: (usize, usize),
     /// Path of the raw (local only: report and closed loop; never written to the calibration).
     pub raw_path: PathBuf,
     /// Path of the export (local only).
@@ -231,11 +234,35 @@ fn single_model(models: &[(String, String)]) -> Result<()> {
 
 /// Hold out every `round(1 / share)`-th raw (by capture time), never all of them.
 fn held_out(order: usize, n: usize, share: f64) -> bool {
+    held_out_in_fold(order, n, share, 0)
+}
+
+/// [`held_out`] for fold `fold` of `round(1 / share)`: fold 0 is the default choice, each further fold holds out the
+/// raw one earlier in every group, so the folds together hold out every raw once.
+fn held_out_in_fold(order: usize, n: usize, share: f64, fold: usize) -> bool {
     if !(share.is_finite() && share > 0.0) || n < 2 {
         return false;
     }
     let every = ((1.0 / share.min(0.5)).round() as usize).max(2);
-    order % every == every - 1
+    order % every == every - 1 - fold % every
+}
+
+/// The number of folds [`hold_out_fold`] cycles through for hold-out share `share` (1 when nothing is held out).
+pub fn folds(share: f64) -> usize {
+    if share.is_finite() && share > 0.0 { ((1.0 / share.min(0.5)).round() as usize).max(2) } else { 1 }
+}
+
+/// Hold out fold `fold` of `photos` (as collected with hold-out share `share`); fold 0 is what `collect` chose. A
+/// fold that would hold out every photo trains on them all, as `collect` does.
+pub fn hold_out_fold(photos: &mut [PhotoSamples], share: f64, fold: usize) {
+    for p in photos.iter_mut() {
+        p.held_out = held_out_in_fold(p.rank.0, p.rank.1, share, fold);
+    }
+    if photos.iter().all(|p| p.held_out) {
+        for p in photos.iter_mut() {
+            p.held_out = false;
+        }
+    }
 }
 
 /// Raws paired with exports of them (same camera model and capture time, else file name), without decoding:
@@ -319,6 +346,7 @@ pub fn collect(raws: &[PathBuf], exports: &[ExportSet], opts: &CollectOptions) -
                         white: White { lightroom_temp_tint: ex.temp_tint, ..ours.white.clone() },
                         samples,
                         held_out: held_out(rank, n_raws, opts.hold_out),
+                        rank: (rank, n_raws),
                         raw_path: rf.path.clone(),
                         export_path: ex.path.clone(),
                         dng: ours.dng,
@@ -399,6 +427,20 @@ mod tests {
         assert!(!(0..1).any(|i| held_out(i, 1, 0.2)));
         assert!(!(0..10).any(|i| held_out(i, 10, 0.0)));
         assert!(!(0..10).any(|i| held_out(i, 10, f64::NAN)));
+    }
+
+    #[test]
+    fn the_folds_hold_out_every_raw_once_and_fold_0_is_the_default() {
+        let n = 23;
+        assert_eq!(folds(0.2), 5);
+        assert_eq!(folds(0.0), 1);
+        assert_eq!(folds(f64::NAN), 1);
+        for i in 0..n {
+            assert_eq!(held_out_in_fold(i, n, 0.2, 0), held_out(i, n, 0.2));
+            assert_eq!((0..5).filter(|f| held_out_in_fold(i, n, 0.2, *f)).count(), 1, "raw {i}");
+            assert_eq!(held_out_in_fold(i, n, 0.2, 7), held_out_in_fold(i, n, 0.2, 2), "folds wrap around");
+        }
+        assert!(!(0..5).any(|f| held_out_in_fold(0, 1, 0.2, f)), "a lone raw is never held out");
     }
 
     #[test]

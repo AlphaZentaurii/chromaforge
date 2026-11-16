@@ -173,6 +173,82 @@ What differs from a Lightroom calibration:
 - Its looks are offered per photo (Profile ▸ Camera profile), never as the camera's default: only a Lightroom
   calibration's first look starts every photo of the camera.
 
+### Brightness-dependent colour (`--value-divisions`)
+
+Some editors' looks change a colour's saturation with its brightness: Capture One's ProStandard makes dark oranges and
+yellows fuller and bright ones paler than one correction per hue can. With `--value-divisions 4,6 --folds 5` the fit
+also tries hue/saturation maps with that many value steps (sRGB-encoded, `ProfileHueSatMapEncoding` 1):
+
+- Every step starts as the single-step correction; a smooth brightness-dependent part is fitted on top. It is pinned to
+  the single-step correction at black, bends slowly along brightness, is pulled back to the single-step correction
+  where few samples back a step, and at white holds the correction of the step below. The fit prints how many
+  training samples (and how many oranges and yellows, with their L*) fall in each step.
+- Each candidate and the single-step map are fitted on every fold (each fold holds out a different fifth of the
+  photos). A candidate is kept only if it beats the single-step map on the mean held-out ΔE00 median and p95, loses no
+  fold clearly (by more than 0.10 median or 0.25 p95), and passes the steepness rule below in every fold. Of the
+  candidates that pass, the smallest wins unless a larger one's mean p95 is at least 0.15 lower. Otherwise the
+  single-step map is written, and the fit says why.
+- **Steepness rule.** How much the map's hue shift and saturation change per stop of brightness between neighbouring
+  value steps (the step up from black is left out, as it spans unboundedly many stops). The cells of both illuminant
+  maps are pooled, in two groups: oranges/yellows (hue 10–60°) and blues (hue 190–250°), saturation 0.15 and up. The
+  99th percentile of each group must stay within the limit in every fold (the worst fold counts, not the mean); the
+  largest change is printed but not checked. The limits are Capture One's own 99th percentile change per stop, plus
+  25 %: oranges/yellows 5.75° and 0.35 (|ln saturation ratio|), blues 3.75° and 0.30. Capture One's figures were
+  measured from its exports of the same photos at −1, 0 and +1 EV: **5 scenes only, and the blue reference comes from
+  a single dusk sky**. The 25 % tolerance is a judgement call, and the same limits apply whichever editor the fit
+  matches.
+- **Near-white check.** The per-stop rule leaves out saturations below 0.15, and bright near-neutrals (clouds,
+  highlights) have almost no training samples and no Capture One reference in the exposure series. A candidate must
+  therefore leave near-white tints about where the same fold's single-step fit puts them: for every hue at saturation
+  0–0.15 and brightness 0.7–1.0, the 99th percentile of the CIELAB a*b* distance between the two maps' outputs must
+  stay within 2.0 in every fold. The limit is a judgement call (about a just-noticeable tint difference). Maps that
+  failed it showed lavender and peach patches between neighbouring cloud areas.
+- Every fit is also written to `OUTDIR/value-divisions/fold-K/N…` for testing.
+- `--allow-steep` also writes each candidate that fails the smoothness rules (steepness or near-white) and nothing
+  else, fitted on all photos (none held out), as `.dcp` files in `OUTDIR/steep`. The file name says
+  `STEEP-N…-all-photos` and the profile name ends in `(N… steep, untested)`, so they import next to your other profiles.
+  They are for trying by eye: no calibration file is written for them, and the default output is the same as without
+  the option. `--all-photos-profiles` writes every candidate that way into `OUTDIR/all-photos`, labelled with whether
+  it passes the rules.
+- `--value-ending pin|fade|hold|hold-sat` (experimental) chooses how the brightness-dependent part ends at white:
+  `hold` (the default) keeps the correction of the step below white, `pin` returns to the single-step correction on the
+  white step, `fade` also pulls it back more strongly over the upper half of the brightness range, and `hold-sat` holds
+  saturated colours and pins near-neutral ones (smoothly, fully held from saturation 0.25). Pinning makes the last step
+  steep where the brights differ most from the single step, and shows as an edge at white in a smooth gradient.
+  Holding near-neutrals carries a thinly supported correction up to white and fails the near-white check.
+- `--value-low-sat-fade S` and `--value-bright-smooth K` (experimental) fade the brightness-dependent part toward the
+  single-step correction below saturation S, and make it K times stiffer along brightness toward white. Neither fixed
+  the near-white patches on the Z 8 data set.
+- `--value-support-fade` (experimental) fades the brightness-dependent part toward the single-step correction where
+  few samples lie nearby, as the single-step fit does with its own correction. On the Z 8 data it made the maps
+  steeper per stop, not smoother.
+- `--value-blue-pull` (experimental) removes the brightness-dependent part for sky blues at every saturation: input
+  hue 200–240° (where cloud pixels of blue skies sit before the map), tapering smoothly to none over 15° on each
+  side. On the Z 8 data it cost about 0.2 held-out ΔE00 median, and the clouds then show the single-step map's own
+  tints instead of cleaner ones.
+- `--table-smooth L` (experimental, also without `--value-divisions`) adds a curvature penalty to every table solve:
+  squared second differences along hue and along saturation, for the hue shift, the saturation scale and the value
+  scale. Each is weighted by L × the largest sample weight of the three cells it spans where all three hold data
+  (so a densely sampled cell whose samples disagree with its neighbours can't keep a jump), and by L × the smallest
+  where it reaches into empty cells. Rough tables turn sensor noise in smooth colour transitions (haze, sky, out-of-focus petals) into
+  mottled colour; on the Z 8 data L = 320 renders those about as smoothly as a Gaussian post-smoothing of the table
+  over 3 cells (L = 40 about like 1.5 cells), and lowers the held-out ΔE00 where post-smoothing raises it.
+- `--photo-cap F` (experimental) lets no photo hold more than F of a table cell's sample weight (for example 0.25), so
+  one photo with many samples of one colour can't decide that cell alone.
+
+Without `--value-divisions` the fit is unchanged. The value steps index brightness as the profile sees it (before the
+exposure slider and the tone curve), so the correction follows the brightness of the scene as captured.
+
+**Known limit and future direction.** Capture One exports of the same photos at −1, 0 and +1 EV suggest that its
+brightness-dependent saturation follows the brightness of the *output*, after its exposure change: the difference to a
+single-step profile stays the same at every exposure when grouped by output lightness, and not when grouped by the
+lightness as captured. A map with value steps sits before ChromaForge's exposure slider (as both the hue/saturation map
+and the look table do), so it matches Capture One best at the exposure the photos were exported at and drifts away
+from it at others. Following Capture One across exposure needs a correction applied after exposure, tied to the tone
+curve's output: a renderer change, not part of this option. A likely but unverified cause is Capture One's tone curve
+itself changing saturation with output brightness (as a curve applied to each RGB channel does), measured so far on
+five photos only.
+
 ## Privacy: what the file holds
 
 Only aggregate numbers: camera make and model, two colour and two forward matrices, optional hue/saturation maps,

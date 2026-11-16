@@ -986,6 +986,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (k != 1.0) {
         d = vec3<f32>(o) + (d - vec3<f32>(o)) * k;
     }
+    // prototype: the channel roll-off (`ToneMap::roll_off_channel`)
+    if (pu(F_CHANNEL_ROLLOFF) != 0u) {
+        let m = max(d.x, max(d.y, d.z));
+        if (yl > 1e-9 && o > 1e-6 && m > o * 1.0001) {
+            let tgt = tone_apply(m * yl / o);
+            let k2 = clamp((tgt - o) / (m - o), 0.0, 1.0);
+            if (k2 < 1.0) {
+                d = vec3<f32>(o) + (d - vec3<f32>(o)) * k2;
+            }
+        }
+    }
     let peak = pf(F_PEAK);
     if (pu(F_RGB_CONTRAST) != 0u) {
         let rc_base = pu(F_RGB_CONTRAST_OFF);

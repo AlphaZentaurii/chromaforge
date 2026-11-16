@@ -34,6 +34,8 @@ pub(crate) mod pipe;
 mod real;
 mod table;
 
+pub use table::ValueEnding;
+
 use model::{LookModel, Model, PhotoDecode};
 
 /// Options for the fit.
@@ -45,7 +47,66 @@ pub struct FitOptions {
     pub editor: Editor,
     /// Refinement rounds of the tables on their residuals (default 3 when 0).
     pub rounds: usize,
+    /// Value divisions of the hue/saturation map (0 or 1: one, the single-step map). Above 1 the map gains a smooth
+    /// brightness-dependent part on top of the single-step correction, pinned to it at black and pulled to
+    /// it where the data is thin ([`table::ValueSplat`]).
+    pub value_divisions: usize,
+    /// Print the oranges'/yellows' held-out chroma error by L* band (from the real renders) for every look.
+    pub report_warm: bool,
+    /// Return the calibration even when the base look does not beat the app's current colour on the held-out photos
+    /// (its evidence says so), for comparing fits with each other; the caller then applies that gate itself.
+    pub keep_ungated: bool,
+    /// How the brightness-dependent part of a map with value divisions ends toward white (held from the step below by default, [`table::ValueEnding::Hold`]).
+    pub value_ending: table::ValueEnding,
+    /// Experimental: below this input saturation the brightness-dependent part fades toward the single-step
+    /// correction (smoothly, to none at grey); 0 = off ([`table::fade_low_saturation`]).
+    pub value_low_sat_fade: f64,
+    /// Experimental: extra stiffness along brightness over the upper half of the value range (× the curvature
+    /// penalty, growing to this at white); 0 = off.
+    pub value_bright_smooth: f64,
+    /// Experimental: fade the brightness-dependent part toward the single-step correction where few samples lie
+    /// nearby, as the single-step fit fades its own correction ([`table::ValueShape::support_fade`]).
+    pub value_support_fade: bool,
+    /// Experimental: pull the brightness-dependent part to the single-step correction for sky blues (input hue
+    /// 200–240°, smooth taper of 15° each side), at every saturation ([`table::pull_blue`]).
+    pub value_blue_pull: bool,
+    /// Opt-in: curvature (second-difference) smoothness of every hue/saturation table along hue and saturation,
+    /// weighted by the local sample weight ([`table::ValueShape::curvature`]); 0 = off.
+    pub table_curvature: f64,
+    /// Opt-in: most of a table cell's weight one photo may hold ([`table::ValueShape::photo_cap`]); 0 = off.
+    pub photo_cap: f64,
+    /// Fit on every photo, none held out: the evidence is then measured on the training photos and no gate applies
+    /// (only with `keep_ungated`; for profiles to try by eye, not for a calibration to send).
+    pub all_photos: bool,
 }
+
+impl FitOptions {
+    fn value_shape(&self) -> table::ValueShape {
+        table::ValueShape {
+            ending: self.value_ending,
+            low_sat_fade: self.value_low_sat_fade,
+            bright_smooth: self.value_bright_smooth,
+            support_fade: self.value_support_fade,
+            blue_pull: self.value_blue_pull,
+            curvature: self.table_curvature,
+            photo_cap: self.photo_cap,
+        }
+    }
+}
+
+/// Whether a calibration's base look (the evidence look with the most photos that has held-out photos) beats the app's
+/// current colour on its held-out photos, median and p95: the gate `fit` applies unless `keep_ungated`.
+pub fn beats_current_colour(cal: &Calibration) -> bool {
+    cal.evidence
+        .looks
+        .iter()
+        .filter(|l| l.held_out > 0)
+        .max_by_key(|l| l.photos)
+        .is_some_and(|l| l.after.median < l.before.median && l.after.p95 < l.before.p95)
+}
+
+/// Largest value divisions `FitOptions::value_divisions` takes.
+pub const MAX_VALUE_DIVISIONS: usize = 16;
 
 const T_A: f64 = 2856.0;
 const T_D65: f64 = 6504.0;
@@ -408,9 +469,18 @@ enum Which {
 }
 
 /// Stages 4 and 5: one refinement round of the hue/saturation map (`Which::HueSat`, dual by white) or of a look table.
-fn table_round(model: &mut Model, look: &mut LookModel, which: Which, photos: &[&PhotoSamples], pairs: &[Pair], lut: &pipe::Lut) {
+fn table_round(
+    model: &mut Model,
+    look: &mut LookModel,
+    which: Which,
+    photos: &[&PhotoSamples],
+    pairs: &[Pair],
+    lut: &pipe::Lut,
+    shape: table::ValueShape,
+) {
     let dec = decodes(model, look, photos);
-    let (mut shared, mut a, mut d) = (table::Splat::default(), table::Splat::default(), table::Splat::default());
+    let cap = shape.photo_cap;
+    let (mut shared, mut a, mut d) = (table::Splat::with_cap(cap), table::Splat::with_cap(cap), table::Splat::with_cap(cap));
     for s in pairs {
         let Some(Some(pd)) = dec.get(s.photo) else { continue };
         let st = pd.stages(s.camera);
@@ -421,32 +491,143 @@ fn table_round(model: &mut Model, look: &mut LookModel, which: Which, photos: &[
                 let gain = pd.gain().max(1e-6);
                 let out = st.look_in.map(|v| v / gain);
                 let tp = tp.map(|v| v / gain);
-                shared.add(st.hsm_in, out, tp, s.w);
-                a.add(st.hsm_in, out, tp, s.w * pd.g);
-                d.add(st.hsm_in, out, tp, s.w * (1.0 - pd.g));
+                shared.add_from(s.photo, st.hsm_in, out, tp, s.w);
+                a.add_from(s.photo, st.hsm_in, out, tp, s.w * pd.g);
+                d.add_from(s.photo, st.hsm_in, out, tp, s.w * (1.0 - pd.g));
             }
-            Which::Look => shared.add(st.look_in, pd.to_prophoto(st.scene), tp, s.w),
+            Which::Look => shared.add_from(s.photo, st.look_in, pd.to_prophoto(st.scene), tp, s.w),
         }
     }
     const SMOOTH: f64 = 0.5;
-    let cs = shared.solve(SMOOTH);
+    let cs = shared.solve_with(SMOOTH, shape.curvature);
     match which {
         Which::HueSat => {
             let total = shared.total().max(1e-9);
             let blend = |own: &table::Splat| -> Vec<[f64; 3]> {
-                let c = own.solve(SMOOTH);
+                let c = own.solve_with(SMOOTH, shape.curvature);
                 let k = own.total() / (own.total() + 0.3 * total);
                 cs.iter().zip(&c).map(|(s, o)| std::array::from_fn(|i| s[i] + (o[i] - s[i]) * k)).collect()
             };
             let (ca, cd) = (blend(&a), blend(&d));
             let [ta, td] = model.hsm.clone().unwrap_or([table::identity(), table::identity()]);
-            model.hsm = Some([table::compose(&ta, &ca, 1.0), table::compose(&td, &cd, 1.0)]);
+            if ta.val_divisions > 1 && ta.val_divisions == td.val_divisions {
+                // a map with value divisions: the single-step part on every plane, then its brightness-dependent part
+                model.hsm = Some([table::compose_all_planes(&ta, &ca), table::compose_all_planes(&td, &cd)]);
+                value_round(model, look, photos, pairs, lut, ta.val_divisions, shape);
+            } else {
+                model.hsm = Some([table::compose(&ta, &ca, 1.0), table::compose(&td, &cd, 1.0)]);
+            }
         }
         Which::Look => {
             let t = look.table.clone().unwrap_or_else(table::identity);
             look.table = Some(table::compose(&t, &cs, 1.0));
         }
     }
+}
+
+/// The brightness-dependent part of one hue/saturation-map round (maps with `vals` value divisions): the residuals
+/// after the single-step part, splatted along value and solved smooth, dual by white as the single-step map.
+fn value_round(
+    model: &mut Model,
+    look: &LookModel,
+    photos: &[&PhotoSamples],
+    pairs: &[Pair],
+    lut: &pipe::Lut,
+    vals: usize,
+    shape: table::ValueShape,
+) {
+    let dec = decodes(model, look, photos);
+    let (mut shared, mut a, mut d) = {
+        let cap = shape.photo_cap;
+        (table::ValueSplat::with_cap(vals, cap), table::ValueSplat::with_cap(vals, cap), table::ValueSplat::with_cap(vals, cap))
+    };
+    for s in pairs {
+        let Some(Some(pd)) = dec.get(s.photo) else { continue };
+        let st = pd.stages(s.camera);
+        let Some(target) = lut.invert(s.xyz, st.scene) else { continue };
+        let gain = pd.gain().max(1e-6);
+        let out = st.look_in.map(|v| v / gain);
+        let tp = pd.to_prophoto(target).map(|v| v / gain);
+        shared.add_from(s.photo, st.hsm_in, out, tp, s.w);
+        a.add_from(s.photo, st.hsm_in, out, tp, s.w * pd.g);
+        d.add_from(s.photo, st.hsm_in, out, tp, s.w * (1.0 - pd.g));
+    }
+    let cs = shared.solve(shape);
+    let total = shared.total().max(1e-9);
+    let blend = |own: &table::ValueSplat| -> Vec<[f64; 2]> {
+        let c = own.solve(shape);
+        let k = own.total() / (own.total() + 0.3 * total);
+        cs.iter().zip(&c).map(|(s, o)| std::array::from_fn(|i| s[i] + (o[i] - s[i]) * k)).collect()
+    };
+    let (mut da, mut dd) = (blend(&a), blend(&d));
+    table::fade_low_saturation(&mut da, shape.low_sat_fade);
+    table::fade_low_saturation(&mut dd, shape.low_sat_fade);
+    if shape.blue_pull {
+        table::pull_blue(&mut da);
+        table::pull_blue(&mut dd);
+    }
+    if let Some([ta, td]) = model.hsm.clone() {
+        model.hsm = Some([table::compose_value(&ta, &da), table::compose_value(&td, &dd)]);
+    }
+}
+
+/// Whether target colour `lab` is an orange or yellow (CIELAB hue 40–100°, chroma ≥ 20): the colours whose saturation
+/// depends most on brightness in an editor's look.
+fn warm(lab: [f64; 3]) -> bool {
+    let h = lab[2].atan2(lab[1]).to_degrees().rem_euclid(360.0);
+    lab[1].hypot(lab[2]) >= 20.0 && (40.0..100.0).contains(&h)
+}
+
+/// Training samples per value step of a map with `vals` divisions (all colours, and oranges/yellows with their mean
+/// target L*), printed so the steps the data supports can be seen.
+fn print_value_support(model: &Model, look: &LookModel, photos: &[&PhotoSamples], pairs: &[Pair], vals: usize) {
+    let dec = decodes(model, look, photos);
+    let mut rows = vec![(0usize, 0usize, 0.0f64); vals.max(2)];
+    for s in pairs {
+        let Some(Some(pd)) = dec.get(s.photo) else { continue };
+        let Some(e) = table::encoded_value(pd.stages(s.camera).hsm_in) else { continue };
+        let Some(r) = rows.get_mut(table::value_step(e, vals)) else { continue };
+        r.0 += 1;
+        if warm(s.lab) {
+            r.1 += 1;
+            r.2 += s.lab[0];
+        }
+    }
+    eprintln!("value divisions {vals}: training samples per value step (encoded value: all / oranges+yellows, their mean L*)");
+    for (v, (all, w, l)) in rows.iter().enumerate() {
+        let lstar = if *w > 0 { format!("{:.0}", l / *w as f64) } else { "-".into() };
+        eprintln!("  step {v} (value {:.2}): {all} / {w}, L* {lstar}", v as f64 / (vals.max(2) - 1) as f64);
+    }
+}
+
+/// Oranges/yellows on the held-out photos: mean chroma error (render − target) and count per target-L* band.
+fn print_warm_bands(name: &str, ps: &[Pair], got: &[Option<[f64; 3]>]) {
+    const BANDS: [(f64, f64); 4] = [(0.0, 40.0), (40.0, 55.0), (55.0, 70.0), (70.0, 101.0)];
+    let mut acc = [(0.0f64, 0usize); 4];
+    for (s, g) in ps.iter().zip(got) {
+        let Some(g) = g else { continue };
+        if !warm(s.lab) {
+            continue;
+        }
+        let r = deltae::lab(*g);
+        let Some(b) = BANDS.iter().position(|(lo, hi)| s.lab[0] >= *lo && s.lab[0] < *hi) else { continue };
+        if let Some(a) = acc.get_mut(b) {
+            a.0 += r[1].hypot(r[2]) - s.lab[1].hypot(s.lab[2]);
+            a.1 += 1;
+        }
+    }
+    let cells: Vec<String> = BANDS
+        .iter()
+        .zip(&acc)
+        .map(|((lo, hi), (sum, n))| {
+            if *n > 0 {
+                format!("L* {lo:.0}–{:.0}: {:+.1} ({n})", hi.min(100.0), sum / *n as f64)
+            } else {
+                format!("L* {lo:.0}–{:.0}: -", hi.min(100.0))
+            }
+        })
+        .collect();
+    eprintln!("held-out oranges/yellows {name:?}, chroma error by L*: {}", cells.join(", "));
 }
 
 /// One look's fitted parts.
@@ -511,7 +692,8 @@ pub fn fit(photos: &[PhotoSamples], opts: &FitOptions) -> Result<Calibration> {
         .or_else(|| names.iter().max_by_key(|(_, c)| *c))
         .map(|(n, _)| n.clone())
         .ok_or_else(|| Error("no looks".into()))?;
-    let train: Vec<&PhotoSamples> = photos.iter().filter(|p| !p.held_out).collect();
+    let all_photos = opts.all_photos && opts.keep_ungated;
+    let train: Vec<&PhotoSamples> = photos.iter().filter(|p| all_photos || !p.held_out).collect();
     let base_train: Vec<&PhotoSamples> = train.iter().copied().filter(|p| p.look.trim() == base).collect();
     if base_train.is_empty() {
         return Err(Error(format!("no training photos for the base look {base:?}: hold out fewer photos")));
@@ -541,7 +723,21 @@ pub fn fit(photos: &[PhotoSamples], opts: &FitOptions) -> Result<Calibration> {
     let table_pairs = pairs(&base_train, TABLE_SAMPLES);
     let mut base_look = LookModel::default();
     for _ in 0..rounds {
-        table_round(&mut model, &mut base_look, Which::HueSat, &base_train, &table_pairs, &lut);
+        table_round(&mut model, &mut base_look, Which::HueSat, &base_train, &table_pairs, &lut, opts.value_shape());
+    }
+    // 4b. value divisions: the single-step map spread over the value planes, then refined with its
+    // brightness-dependent part (the closed loop below refines both)
+    let vals = opts.value_divisions;
+    if vals > 1 {
+        if vals > MAX_VALUE_DIVISIONS {
+            return Err(Error(format!("value divisions: {vals} is more than {MAX_VALUE_DIVISIONS}")));
+        }
+        let [ta, td] = model.hsm.clone().unwrap_or([table::identity(), table::identity()]);
+        model.hsm = Some([table::with_value_divisions(&ta, vals), table::with_value_divisions(&td, vals)]);
+        print_value_support(&model, &base_look, &base_train, &table_pairs, vals);
+        for _ in 0..rounds {
+            table_round(&mut model, &mut base_look, Which::HueSat, &base_train, &table_pairs, &lut, opts.value_shape());
+        }
     }
     if model.hsm.as_ref().is_some_and(|[a, b]| table::is_identity(a) && table::is_identity(b)) {
         model.hsm = None;
@@ -559,7 +755,7 @@ pub fn fit(photos: &[PhotoSamples], opts: &FitOptions) -> Result<Calibration> {
         let lut = lut_for(&tone)?;
         let mut look = LookModel::default();
         for _ in 0..rounds {
-            table_round(&mut model.clone(), &mut look, Which::Look, &set, &lp, &lut);
+            table_round(&mut model.clone(), &mut look, Which::Look, &set, &lp, &lut, opts.value_shape());
         }
         if look.table.as_ref().is_some_and(table::is_identity) {
             look.table = None;
@@ -575,7 +771,7 @@ pub fn fit(photos: &[PhotoSamples], opts: &FitOptions) -> Result<Calibration> {
     // 6. closed loop through the real decode
     let prior_fm = prior.fm_target;
     let who = Who { make: &make, model: &model_name, contributor: opts.contributor.as_deref(), editor: opts.editor };
-    closed_loop(&mut model, &mut looks, &train, &base, &who, prior_fm);
+    closed_loop(&mut model, &mut looks, &train, &base, &who, prior_fm, opts.value_shape());
 
     // 7. evidence and gates
     let candidate = assemble(&who, &model, &looks, prior_fm, Evidence::default());
@@ -585,7 +781,8 @@ pub fn fit(photos: &[PhotoSamples], opts: &FitOptions) -> Result<Calibration> {
     let mut gated = 0usize;
     let mut dropped: Vec<String> = Vec::new();
     for l in &looks {
-        let of_look = |held: bool| -> Vec<&PhotoSamples> { photos.iter().filter(|p| p.held_out == held && p.look.trim() == l.name).collect() };
+        let of_look =
+            |held: bool| -> Vec<&PhotoSamples> { photos.iter().filter(|p| (p.held_out && !all_photos) == held && p.look.trim() == l.name).collect() };
         let (held, trained) = (of_look(true), of_look(false));
         let set = if held.is_empty() { &trained } else { &held };
         let ps = pairs(set, usize::MAX);
@@ -603,6 +800,9 @@ pub fn fit(photos: &[PhotoSamples], opts: &FitOptions) -> Result<Calibration> {
                         before.push(deltae::de2000(deltae::lab(*b), s.lab));
                         after.push(deltae::de2000(deltae::lab(*a), s.lab));
                     }
+                }
+                if opts.report_warm && !held.is_empty() {
+                    print_warm_bands(&l.name, &ps, &ra);
                 }
             }
             Err(e) => eprintln!("note: {}: ΔE00 from the analytic model, a raw could not be rendered ({e})", l.name),
@@ -624,7 +824,7 @@ pub fn fit(photos: &[PhotoSamples], opts: &FitOptions) -> Result<Calibration> {
                 dropped.push(l.name.clone());
                 continue;
             }
-            if !(a.median < b.median && a.p95 < b.p95) {
+            if !(a.median < b.median && a.p95 < b.p95) && !opts.keep_ungated {
                 return Err(Error(format!(
                     "{}: on the held-out photos the fitted colour (ΔE00 median {:.2}, p95 {:.2}) does not beat the app's current colour \
                      (median {:.2}, p95 {:.2}). Add more photos with varied colours and light (daylight, shade and tungsten), and check \
@@ -636,7 +836,7 @@ pub fn fit(photos: &[PhotoSamples], opts: &FitOptions) -> Result<Calibration> {
         look_evidence.push(LookEvidence { name: l.name.clone(), photos: count_photos(&trained), held_out: count_photos(&held), before: b, after: a });
     }
     looks.retain(|l| !dropped.contains(&l.name));
-    if gated == 0 {
+    if gated == 0 && !all_photos {
         return Err(Error("no held-out photos to check the fit on: collect with a hold-out share above 0, or add photos".into()));
     }
 
@@ -651,6 +851,205 @@ pub fn fit(photos: &[PhotoSamples], opts: &FitOptions) -> Result<Calibration> {
     let cal = assemble(&who, &model, &looks, prior_fm, evidence);
     cal.validate().map_err(|e| Error(format!("the fitted calibration is not valid: {e}")))?;
     Ok(cal)
+}
+
+/// How steeply a calibration's hue/saturation maps change along value, the worse of the two maps: the largest hue
+/// shift change (° per unit of encoded value) and saturation change (|ln ratio| per unit). `(0, 0)` without value
+/// divisions.
+pub fn value_steepness(cal: &Calibration) -> (f64, f64) {
+    value_steepness_quantile(cal, 1.0)
+}
+
+/// [`value_steepness`] at quantile `q` of the cells' changes (the worse of the two maps).
+pub fn value_steepness_quantile(cal: &Calibration, q: f64) -> (f64, f64) {
+    cal.camera.hue_sat_map.as_ref().map_or((0.0, 0.0), |maps| {
+        maps.iter().map(|t| table::value_steepness_quantile(t, q)).fold((0.0f64, 0.0f64), |(h, s), (a, b)| (h.max(a), s.max(b)))
+    })
+}
+
+/// How steeply a calibration's hue/saturation maps change per stop of brightness, at one quantile of the cells:
+/// hue change (°/stop) and saturation change (|ln ratio|/stop) for the oranges/yellows and for the blues, both maps
+/// (illuminants) and every value step but the one from black pooled ([`table::changes_per_stop`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct StopSteepness {
+    pub warm: (f64, f64),
+    pub blue: (f64, f64),
+}
+
+/// [`StopSteepness`] of `cal` at quantile `q` (0.99: the 99th percentile; 1: the largest). All zero without value
+/// divisions.
+pub fn value_steepness_per_stop(cal: &Calibration, q: f64) -> StopSteepness {
+    let mut cells = Vec::new();
+    if let Some(maps) = cal.camera.hue_sat_map.as_ref() {
+        for t in maps {
+            table::changes_per_stop(t, &mut cells);
+        }
+    }
+    let of = |g: table::StopGroup| -> (f64, f64) {
+        let (h, s): (Vec<f64>, Vec<f64>) = cells.iter().filter(|c| c.0 == g).map(|c| (c.1, c.2)).unzip();
+        (table::quantile(h, q), table::quantile(s, q))
+    };
+    StopSteepness { warm: of(table::StopGroup::Warm), blue: of(table::StopGroup::Blue) }
+}
+
+/// The near-white inputs [`near_white_roughness`] and [`near_white_shift`] use: every hue in 1° steps, saturation 0–0.15
+/// in 60 steps, value 0.7, 0.8, 0.9 and 1.0 (linear ProPhoto HSV), as (hue index, saturation index, value) rows.
+const NEAR_WHITE_HUES: usize = 360;
+const NEAR_WHITE_SATS: usize = 60;
+const NEAR_WHITE_VALUES: [f64; 4] = [0.7, 0.8, 0.9, 1.0];
+
+fn near_white_input(h: usize, s: usize, v: f64) -> [f32; 3] {
+    table::rgb_of_hsv(h as f64, 0.15 * s as f64 / (NEAR_WHITE_SATS - 1) as f64, v)
+}
+
+/// CIELAB a*b* of a linear ProPhoto colour.
+fn ab_of(c: [f32; 3]) -> [f64; 2] {
+    const PRO_TO_XYZ: [[f64; 3]; 3] = [[0.7976749, 0.1351917, 0.0313534], [0.2880402, 0.7118741, 0.0000857], [0.0, 0.0, 0.8252100]];
+    let c = c.map(f64::from);
+    let xyz: [f64; 3] = std::array::from_fn(|i| PRO_TO_XYZ[i][0] * c[0] + PRO_TO_XYZ[i][1] * c[1] + PRO_TO_XYZ[i][2] * c[2]);
+    let l = deltae::lab(xyz);
+    [l[1], l[2]]
+}
+
+/// How far a calibration's hue/saturation maps move near-white tints away from those of `base` (normally the
+/// single-step fit of the same photos): the CIELAB a*b* distance between the two maps' outputs for the near-white
+/// inputs ([`NEAR_WHITE_VALUES`]; each map against `base`'s map for the same illuminant), quantile `q`. Bright
+/// near-neutrals (clouds, highlights) have few samples, so a map with value divisions should leave them about where
+/// the single-step map puts them. 0 when either has no map.
+pub fn near_white_shift(cal: &Calibration, base: &Calibration, q: f64) -> f64 {
+    let (Some(maps), Some(bases)) = (cal.camera.hue_sat_map.as_ref(), base.camera.hue_sat_map.as_ref()) else { return 0.0 };
+    let mut d = Vec::new();
+    for (t, b) in maps.iter().zip(bases) {
+        for v in NEAR_WHITE_VALUES {
+            for s in 0..NEAR_WHITE_SATS {
+                for h in 0..NEAR_WHITE_HUES {
+                    let input = near_white_input(h, s, v);
+                    let (x, y) = (ab_of(t.apply(input)), ab_of(b.apply(input)));
+                    d.push((x[0] - y[0]).hypot(x[1] - y[1]));
+                }
+            }
+        }
+    }
+    table::quantile(d, q)
+}
+
+/// Perturbation steps of [`noise_excess`]: a fine one about the size of sensor noise and a coarse one spanning a few
+/// table cells (fractions of the colour's brightness, on each ProPhoto channel).
+const NOISE_STEP_FINE: f32 = 0.005;
+const NOISE_STEP_COARSE: f32 = 0.04;
+
+/// How much more a hue/saturation map amplifies sensor-sized colour noise than it amplifies a coarser colour change, at
+/// one input colour (linear ProPhoto): the mean CIELAB distance between the map's outputs for the colour and for 8
+/// perturbations of each step size, divided by the same distance without the map, fine minus coarse. A smooth map,
+/// even a strong one, gives about 0; a cell whose correction jumps away from its neighbours' gives well above 0, since
+/// noise moving a colour across that cell's edges changes the output more than the colour changed (mottling).
+fn noise_excess_at(map: &lcc_raw::profile::HsvTable, c: [f32; 3]) -> f64 {
+    const PRO_TO_XYZ: [[f64; 3]; 3] = [[0.7976749, 0.1351917, 0.0313534], [0.2880402, 0.7118741, 0.0000857], [0.0, 0.0, 0.8252100]];
+    let lab = |c: [f32; 3]| -> [f64; 3] {
+        let c = c.map(f64::from);
+        deltae::lab(std::array::from_fn(|i| PRO_TO_XYZ[i][0] * c[0] + PRO_TO_XYZ[i][1] * c[1] + PRO_TO_XYZ[i][2] * c[2]))
+    };
+    let dist = |a: [f64; 3], b: [f64; 3]| ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt();
+    let v = c[0].max(c[1]).max(c[2]);
+    let (out0, in0) = (lab(map.apply(c)), lab(c));
+    let gain = |step: f32| -> f64 {
+        let (mut dout, mut din) = (0.0, 0.0);
+        for k in 0..8u32 {
+            let s = |b: u32| if (k >> b) & 1 == 1 { step * v } else { -step * v };
+            let p = [c[0] + s(0), c[1] + s(1), c[2] + s(2)];
+            dout += dist(lab(map.apply(p)), out0);
+            din += dist(lab(p), in0);
+        }
+        if din > 0.0 { dout / din } else { 1.0 }
+    };
+    gain(NOISE_STEP_FINE) - gain(NOISE_STEP_COARSE)
+}
+
+/// The worst photo's noise excess of a calibration's hue/saturation maps ([`noise_excess_at`] averaged over the
+/// photo's samples as they enter the map, both illuminant maps blended by the photo's white), and the number of photos
+/// measured. Samples at black or at the clip point are left out. `(0, 0)` without a map.
+///
+/// A flat area of one colour (haze, sky) whose colour sits where the map jumps from cell to cell renders mottled even
+/// though the map fits the photos' colours well: the fit averages each cell's samples, and a cell whose samples
+/// disagree with its neighbours' can end up far from them. Measured per photo, because the problem is local to the
+/// few colours a photo is made of: pooled over all photos it disappears.
+pub fn noise_excess(cal: &Calibration, photos: &[PhotoSamples]) -> (f64, usize) {
+    let per = noise_excess_per_photo(cal, photos);
+    (per.first().map_or(0.0, |p| p.1), per.len())
+}
+
+/// [`noise_excess`] for every photo measured: (index into `photos`, mean excess), worst first.
+pub fn noise_excess_per_photo(cal: &Calibration, photos: &[PhotoSamples]) -> Vec<(usize, f64)> {
+    let Some(maps) = cal.camera.hue_sat_map.as_ref() else { return Vec::new() };
+    let model = Model { cm: cal.camera.color_matrix, fm: Some(cal.camera.forward_matrix), hsm: Some(maps.clone()) };
+    let look = LookModel { offset: cal.looks.first().map_or(0.0, |l| l.baseline_exposure_offset), table: None };
+    let refs: Vec<&PhotoSamples> = photos.iter().collect();
+    let dec = decodes(&model, &look, &refs);
+    let mut per = Vec::new();
+    for (i, (p, pd)) in photos.iter().zip(&dec).enumerate() {
+        let Some(pd) = pd else { continue };
+        let (mut sum, mut k) = (0.0, 0usize);
+        for s in &p.samples {
+            let c = pd.stages(s.camera).hsm_in;
+            let v = c[0].max(c[1]).max(c[2]);
+            if !(v > 0.02 && v < 0.98) {
+                continue;
+            }
+            sum += pd.g * noise_excess_at(&maps[0], c) + (1.0 - pd.g) * noise_excess_at(&maps[1], c);
+            k += 1;
+        }
+        if k > 0 {
+            per.push((i, sum / k as f64));
+        }
+    }
+    per.sort_by(|a, b| b.1.total_cmp(&a.1));
+    per
+}
+
+/// How unevenly a calibration's hue/saturation maps move near-white tints: inputs of every hue (1° steps) at saturation
+/// 0–0.15 (60 steps) and value 0.7, 0.8, 0.9 and 1.0 (linear ProPhoto HSV) go through each map as the renderer applies
+/// it, and for every pair of neighbouring inputs the CIELAB a*b* distance of the outputs is divided by that of the
+/// inputs. Returns quantile `q` of those ratios over both maps (1 = tints move evenly; well above 1 = neighbouring
+/// near-whites land on clearly different tints: the patchy clouds a thinly supported map can give). 0 without a map.
+pub fn near_white_roughness(cal: &Calibration, q: f64) -> f64 {
+    const PRO_TO_XYZ: [[f64; 3]; 3] = [[0.7976749, 0.1351917, 0.0313534], [0.2880402, 0.7118741, 0.0000857], [0.0, 0.0, 0.8252100]];
+    let ab = |c: [f32; 3]| -> [f64; 2] {
+        let c = c.map(f64::from);
+        let xyz: [f64; 3] = std::array::from_fn(|i| PRO_TO_XYZ[i][0] * c[0] + PRO_TO_XYZ[i][1] * c[1] + PRO_TO_XYZ[i][2] * c[2]);
+        let l = deltae::lab(xyz);
+        [l[1], l[2]]
+    };
+    let Some(maps) = cal.camera.hue_sat_map.as_ref() else { return 0.0 };
+    let (hues, sats) = (360usize, 60usize);
+    let mut ratios = Vec::new();
+    for t in maps {
+        for v in [0.7f64, 0.8, 0.9, 1.0] {
+            let grid: Vec<([f64; 2], [f64; 2])> = (0..sats)
+                .flat_map(|s| (0..hues).map(move |h| (h, s)))
+                .map(|(h, s)| {
+                    let input = table::rgb_of_hsv(h as f64, 0.15 * s as f64 / (sats - 1) as f64, v);
+                    (ab(input), ab(t.apply(input)))
+                })
+                .collect();
+            for s in 0..sats {
+                for h in 0..hues {
+                    let k = s * hues + h;
+                    let mut nbs = vec![s * hues + (h + 1) % hues];
+                    if s + 1 < sats {
+                        nbs.push(k + hues);
+                    }
+                    for n in nbs {
+                        let (Some(a), Some(b)) = (grid.get(k), grid.get(n)) else { continue };
+                        let din = (a.0[0] - b.0[0]).hypot(a.0[1] - b.0[1]);
+                        if din > 1e-3 {
+                            ratios.push((a.1[0] - b.1[0]).hypot(a.1[1] - b.1[1]) / din);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    table::quantile(ratios, q)
 }
 
 /// Who the calibration is for and by.
@@ -731,7 +1130,15 @@ fn real_outputs(set: &[&PhotoSamples], pairs: &[Pair], candidate: Option<lcc_raw
 /// Step 6: render the training raws with the candidate, fold the gap between the real render and the analytic model
 /// into the targets and refit tone curves and tables; a round that makes the real training error worse is undone.
 /// A raw that can't be rendered stops the loop (the analytic fit stands, with a note).
-fn closed_loop(model: &mut Model, looks: &mut [FittedLook], train: &[&PhotoSamples], base: &str, who: &Who, prior_fm: [Mat3; 2]) {
+fn closed_loop(
+    model: &mut Model,
+    looks: &mut [FittedLook],
+    train: &[&PhotoSamples],
+    base: &str,
+    who: &Who,
+    prior_fm: [Mat3; 2],
+    shape: table::ValueShape,
+) {
     let no_look = LookModel::default();
     let mut best: Option<(f64, Model, Vec<FittedLook>)> = None;
     for round in 0..=LOOP_ROUNDS {
@@ -795,9 +1202,9 @@ fn closed_loop(model: &mut Model, looks: &mut [FittedLook], train: &[&PhotoSampl
             l.lut = lut;
             let FittedLook { look, lut, name, .. } = l;
             if name == base {
-                table_round(model, look, Which::HueSat, &set, &adj, lut);
+                table_round(model, look, Which::HueSat, &set, &adj, lut, shape);
             } else {
-                table_round(&mut model.clone(), look, Which::Look, &set, &adj, lut);
+                table_round(&mut model.clone(), look, Which::Look, &set, &adj, lut, shape);
             }
         }
     }

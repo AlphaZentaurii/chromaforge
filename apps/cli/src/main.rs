@@ -157,6 +157,20 @@ USAGE:
       folder per Lightroom profile). Writes <Make>_<Model>.json (the file to send: numbers only, no images) and
       one .dcp per look for your own testing. --lens: the fit is for that lens only (Exif lens model, e.g. one
       of a phone's cameras). --dry-run pairs and reports coverage without fitting.
+      --value-divisions N[,N…] [--folds K]: also fit hue/saturation maps whose correction changes with brightness
+      (N value steps) and keep one only if it beats the single-step map on held-out photos over K folds (default 1).
+      --allow-steep: also write each candidate that fails only the steepness check, fitted on all photos, as
+      separately named .dcp files in OUTDIR/steep (for trying by eye; never the file to send).
+      --value-ending pin|fade|hold|hold-sat: how the brightness-dependent part ends at white (experimental; default hold).
+      --value-low-sat-fade S, --value-bright-smooth K (experimental): fade the brightness-dependent part toward the
+      single-step correction below saturation S; make it K times stiffer along brightness toward white.
+      --value-support-fade (experimental): fade the brightness-dependent part where few samples lie nearby.
+      --value-blue-pull (experimental): no brightness-dependent part for sky blues (hue 200–240°, tapered).
+      --table-smooth L (experimental): curvature smoothness of the tables along hue and saturation, scaled by the local
+      sample weight (Z 8: 40 rendered about like a 1.5-cell Gaussian post-smoothing, 320 like 3 cells).
+      --photo-cap F (experimental): no photo holds more than F of a table cell's weight (e.g. 0.25).
+      Both also apply without --value-divisions.
+      --all-photos-profiles: also write every candidate fitted on all photos as labelled .dcp files in OUTDIR/all-photos.
   {cli} calibrate-lightroom add FILE [--repo DIR] [--contributor NAME] [--lens MODEL] [--replace]
       Developers: validate a contributed calibration, write it to crates/camdb/data/calibrations/ and add its
       assets/ATTRIBUTION.md row (DIR: the repository root, default .). A calibration already there for the

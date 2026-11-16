@@ -1167,7 +1167,31 @@ pub(crate) fn dng_tone_curve(curve: &lcc_raw::profile::ToneCurve) -> Option<lcc_
         let x = 2f32.powf(-12.0 + 12.0 * i as f32 / 31.0);
         [x, curve.eval(x).min(0.9995)]
     });
-    lcc_pipeline::tone::CameraTone::new(knots)
+    let tone = lcc_pipeline::tone::CameraTone::new(knots)?;
+    // prototype: the profile curve's colour roll-off, opt-in (`<PREFIX>_TONE_ROLLOFF=lightness|channel`)
+    Some(match tone_rolloff() {
+        lcc_pipeline::tone::ColorRolloff::Off => tone,
+        lcc_pipeline::tone::ColorRolloff::Lightness => tone.with_derived_chroma(rolloff_strength()),
+        lcc_pipeline::tone::ColorRolloff::Channel => tone.with_channel_rolloff(),
+    })
+}
+
+/// Prototype: the share of the lightness roll-off applied, from `<PREFIX>_TONE_ROLLOFF_STRENGTH` (0..1; default 1).
+pub(crate) fn rolloff_strength() -> f32 {
+    static S: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *S.get_or_init(|| lcc_brand::env("TONE_ROLLOFF_STRENGTH").and_then(|v| v.trim().parse::<f32>().ok()).filter(|v| v.is_finite()).map_or(1.0, |v| v.clamp(0.0, 1.0)))
+}
+
+/// Prototype: the colour roll-off a profile's tone curve gets, from `<PREFIX>_TONE_ROLLOFF` (`lightness`, `channel`;
+/// anything else or unset: off, the output unchanged). Read once per process.
+pub(crate) fn tone_rolloff() -> lcc_pipeline::tone::ColorRolloff {
+    use lcc_pipeline::tone::ColorRolloff;
+    static MODE: std::sync::OnceLock<ColorRolloff> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match lcc_brand::env("TONE_ROLLOFF").as_deref().map(str::trim) {
+        Some("lightness") => ColorRolloff::Lightness,
+        Some("channel") => ColorRolloff::Channel,
+        _ => ColorRolloff::Off,
+    })
 }
 
 /// Orientation for an embedded preview: its own EXIF orientation when it has one, else the raw file's.

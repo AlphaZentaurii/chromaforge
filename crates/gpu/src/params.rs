@@ -45,6 +45,8 @@ const FIELDS: &[(&str, usize)] = &[
     ("SHARPEN_V4", 1),
     // process V5: over-range colours keep hue and saturation (`lcc_pipeline::finish::hue_clip`)
     ("HUE_CLIP", 1),
+    // prototype: the channel roll-off (`lcc_pipeline::tone::ToneMap::roll_off_channel`)
+    ("CHANNEL_ROLLOFF", 1),
     // process V8: 8-bit output is ordered-dithered (`lcc_pipeline::finish::bayer_dither_offset`)
     ("DITHER", 1),
     ("SHARPEN", 1),
@@ -347,6 +349,7 @@ pub fn finish_block(fp: &FinishParams, masks: &[[f32; MASK_TERMS]], curves: &[Op
     p.b("DEHAZE_V3", fp.dehaze_v3);
     p.b("SHARPEN_V4", fp.sharpen_v4);
     p.b("HUE_CLIP", fp.hue_clip);
+    p.b("CHANNEL_ROLLOFF", fp.tone.channel_rolloff());
     p.b("DITHER", fp.dither);
     p.f("SHARPEN", fp.sharpen);
     p.f("SHARPEN_MASK", fp.sharpen_mask);
