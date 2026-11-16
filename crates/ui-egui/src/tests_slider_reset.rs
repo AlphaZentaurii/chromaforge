@@ -11,7 +11,7 @@ use crate::{LccApp, Services};
 const T: Duration = Duration::from_secs(20);
 const SETTLE: Duration = Duration::from_secs(120);
 /// The sliders the issue names, each set away from its default.
-const EDITED: [(&str, f64); 2] = [("light.exposure", 1.25), ("light.contrast", 40.0)];
+const EDITED: [(&str, f64); 3] = [("light.exposure", 1.25), ("light.contrast", 40.0), ("light.brightness", 40.0)];
 
 /// The demo library in Detail with the Edit panel's Light section open.
 fn edit_panel() -> Headless {
@@ -126,4 +126,28 @@ fn arrows_still_change_the_photo_after_a_slider_edit() {
     assert_ne!(next, first, "Right shows the next photo after a develop edit");
     ask(&mut h, "ui.key", json!({"key": "ArrowLeft"}));
     assert_eq!(h.app.session.selection.active.unwrap(), first, "Left goes back");
+}
+
+/// Brightness has its row right after Contrast in the Basic section and moves like its neighbours: Up / Down nudge it by
+/// one, Shift + Up / Down by five (a click on the slider selects it first).
+#[test]
+fn the_brightness_row_follows_contrast_and_steps_like_its_neighbours() {
+    let mut h = edit_panel();
+    let (contrast, brightness, highlights) =
+        (widget(&h, "slider:light.contrast"), widget(&h, "slider:light.brightness"), widget(&h, "slider:light.highlights"));
+    assert!(contrast.top() < brightness.top() && brightness.top() < highlights.top(), "{contrast:?} {brightness:?} {highlights:?}");
+    assert_eq!(value(&h, "light.brightness"), 0.0);
+    ask(&mut h, "ui.clickWidget", json!({"id": "slider:light.brightness", "fx": 0.75}));
+    let start = value(&h, "light.brightness");
+    assert!(start > 0.0, "the click set it ({start})");
+    ask(&mut h, "ui.key", json!({"key": "ArrowUp"}));
+    assert_eq!(value(&h, "light.brightness"), start + 1.0, "Up: one step");
+    ask(&mut h, "ui.key", json!({"key": "ArrowDown"}));
+    assert_eq!(value(&h, "light.brightness"), start, "Down: back");
+    ask(&mut h, "ui.key", json!({"key": "ArrowUp", "shift": true}));
+    assert_eq!(value(&h, "light.brightness"), start + 5.0, "Shift + Up: five steps");
+    ask(&mut h, "ui.key", json!({"key": "ArrowDown", "shift": true}));
+    assert_eq!(value(&h, "light.brightness"), start, "Shift + Down: back");
+    // the other Light sliders were left alone
+    assert_eq!(value(&h, "light.contrast"), 0.0);
 }
